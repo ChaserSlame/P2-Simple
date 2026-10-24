@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import tempfile
+import threading
 import unittest
 from fractions import Fraction
 from pathlib import Path
@@ -14,6 +15,7 @@ from p2viewer.synchronization import (
     SyncAnalysis,
     _timecode_seconds,
     _wrapped_delta,
+    analyze_clips_sync,
     analyze_clip_sync,
     build_synced_mxf,
 )
@@ -76,6 +78,36 @@ class SynchronizationTests(unittest.TestCase):
             ),
             Fraction(1, 25),
         )
+
+    def test_clip_sync_analysis_runs_concurrently_and_preserves_input_order(self) -> None:
+        clips = tuple(
+            self._clip(Path(f"/virtual/clip-{index}"))
+            for index in range(4)
+        )
+        barrier = threading.Barrier(4)
+        progress: list[tuple[int, int, str]] = []
+
+        def fake_analyze(clip: P2ClipMetadata) -> SyncAnalysis:
+            barrier.wait(timeout=3)
+            return SyncAnalysis(clip, None, None, (), ())
+
+        with patch(
+            "p2viewer.synchronization.analyze_clip_sync",
+            side_effect=fake_analyze,
+        ):
+            results = analyze_clips_sync(
+                clips,
+                lambda completed, total, analysis: progress.append(
+                    (completed, total, analysis.clip.clip_id)
+                ),
+            )
+
+        self.assertEqual([result.clip for result in results], list(clips))
+        self.assertEqual(
+            sorted(completed for completed, _, _ in progress),
+            [1, 2, 3, 4],
+        )
+        self.assertTrue(all(total == 4 for _, total, _ in progress))
 
     def test_analysis_measures_nonzero_offset_and_keeps_clip_buildable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

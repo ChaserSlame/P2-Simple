@@ -1,19 +1,25 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import subprocess
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
+from typing import Callable
 
 from p2viewer.p2_metadata import P2ClipMetadata
 
 
 FFPROBE_TIMEOUT_SECONDS = 30
 FFMPEG_TIMEOUT_SECONDS = 60 * 60
+SYNC_ANALYSIS_MAX_WORKERS = 4
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -124,6 +130,7 @@ def _probe(path: Path, executable: str) -> dict[str, object]:
         "json",
         str(path),
     ]
+    probe_started = time.perf_counter()
     try:
         result = subprocess.run(
             command,
@@ -131,6 +138,11 @@ def _probe(path: Path, executable: str) -> dict[str, object]:
             capture_output=True,
             text=True,
             timeout=FFPROBE_TIMEOUT_SECONDS,
+        )
+        logger.info(
+            "Media probe completed: file=%s elapsed=%.3fs",
+            path.name,
+            time.perf_counter() - probe_started,
         )
     except FileNotFoundError as error:
         raise MediaProbeError(f"No se encontró {executable} en PATH.") from error
@@ -327,6 +339,44 @@ def analyze_clip_sync(
         )
 
 
+def analyze_clips_sync(
+    clips: tuple[P2ClipMetadata, ...],
+    on_progress: Callable[[int, int, SyncAnalysis], None] | None = None,
+) -> list[SyncAnalysis]:
+    if not clips:
+        return []
+
+    def analyze_one(clip: P2ClipMetadata) -> SyncAnalysis:
+        started = time.perf_counter()
+        analysis = analyze_clip_sync(clip)
+        logger.info(
+            "P2 synchronization completed: clip=%s audio_tracks=%d "
+            "eligible=%s elapsed=%.3fs",
+            clip.clip_id,
+            len(analysis.audio),
+            analysis.eligible,
+            time.perf_counter() - started,
+        )
+        return analysis
+
+    analyses: list[SyncAnalysis | None] = [None] * len(clips)
+    with ThreadPoolExecutor(
+        max_workers=min(SYNC_ANALYSIS_MAX_WORKERS, len(clips))
+    ) as executor:
+        futures = {
+            executor.submit(analyze_one, clip): index
+            for index, clip in enumerate(clips)
+        }
+        for completed, future in enumerate(as_completed(futures), start=1):
+            index = futures[future]
+            analysis = future.result()
+            analyses[index] = analysis
+            if on_progress is not None:
+                on_progress(completed, len(clips), analysis)
+
+    return [analysis for analysis in analyses if analysis is not None]
+
+
 def _offset_argument(value: Fraction) -> str:
     return f"{float(value):.9f}"
 
@@ -406,6 +456,7 @@ def build_synced_mxf(
         )
     )
 
+    encode_started = time.perf_counter()
     try:
         result = subprocess.run(
             command,
@@ -415,8 +466,19 @@ def build_synced_mxf(
             timeout=FFMPEG_TIMEOUT_SECONDS,
         )
         del result
+        logger.info(
+            "MXF stream copy completed: clip=%s elapsed=%.3fs",
+            clip.clip_id,
+            time.perf_counter() - encode_started,
+        )
+        validation_started = time.perf_counter()
         output_analysis = _probe_output(temporary_path, ffprobe)
         _validate_output(analysis, output_analysis)
+        logger.info(
+            "MXF output validation completed: clip=%s elapsed=%.3fs",
+            clip.clip_id,
+            time.perf_counter() - validation_started,
+        )
         os.link(temporary_path, output_path)
         temporary_path.unlink()
     except subprocess.TimeoutExpired as error:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import subprocess
 import threading
 import time
@@ -9,6 +10,7 @@ from p2viewer.synchronization import AudioSync
 
 
 PREVIEW_RENDER_TIMEOUT_SECONDS = 60 * 30
+logger = logging.getLogger(__name__)
 
 
 class PreviewRenderError(RuntimeError):
@@ -16,6 +18,10 @@ class PreviewRenderError(RuntimeError):
 
 
 class PreviewRenderCancelled(RuntimeError):
+    pass
+
+
+class _FFmpegEncodingError(PreviewRenderError):
     pass
 
 
@@ -72,23 +78,96 @@ def render_playback_proxy(
             )
         )
 
-    command.extend(
-        (
-            "-vf",
-            "scale=640:360:force_original_aspect_ratio=decrease:"
-            "force_divisible_by=2",
-            "-c:v",
-            "mpeg4",
-            "-q:v",
-            "5",
-            "-pix_fmt",
-            "yuv420p",
-        )
-    )
+    video_copy_path = output_path.with_name(f"{output_path.stem}-copy.mov")
+    copy_command = [
+        *command,
+        "-map_metadata",
+        "0",
+        "-c:v",
+        "copy",
+    ]
     if audio_tracks:
-        command.extend(("-c:a", "aac", "-b:a", "192k", "-ac", "2"))
-    command.extend(("-movflags", "+faststart", str(output_path)))
+        copy_command.extend(("-c:a", "aac", "-b:a", "192k", "-ac", "2"))
+    copy_command.extend(("-movflags", "+faststart", str(video_copy_path)))
 
+    render_started = time.perf_counter()
+    try:
+        try:
+            copy_started = time.perf_counter()
+            _run_ffmpeg(
+                copy_command,
+                video_path,
+                cancel_event,
+            )
+            _validate_output(video_copy_path, video_path)
+            logger.info(
+                "Preview video stream copy completed: video=%s elapsed=%.3fs "
+                "size_mb=%.2f",
+                video_path.name,
+                time.perf_counter() - copy_started,
+                video_copy_path.stat().st_size / (1024 * 1024),
+            )
+            final_path = video_copy_path
+        except _FFmpegEncodingError as error:
+            _remove_partial_output(video_copy_path, error)
+            logger.warning(
+                "Preview stream copy unavailable: video=%s reason=%s; "
+                "falling back to video transcode",
+                video_path.name,
+                error,
+            )
+            transcode_command = [
+                *command,
+                "-vf",
+                "scale=640:360:force_original_aspect_ratio=decrease:"
+                "force_divisible_by=2",
+                "-c:v",
+                "mpeg4",
+                "-q:v",
+                "5",
+                "-pix_fmt",
+                "yuv420p",
+            ]
+            if audio_tracks:
+                transcode_command.extend(("-c:a", "aac", "-b:a", "192k", "-ac", "2"))
+            transcode_command.extend(("-movflags", "+faststart", str(output_path)))
+            _run_ffmpeg(
+                transcode_command,
+                video_path,
+                cancel_event,
+            )
+            _validate_output(output_path, video_path)
+            final_path = output_path
+    except (PreviewRenderCancelled, PreviewRenderError) as error:
+        _remove_partial_output(video_copy_path, error)
+        _remove_partial_output(output_path, error)
+        raise
+    finally:
+        logger.info(
+            "Preview render finished: video=%s audio_tracks=%d elapsed=%.3fs",
+            video_path.name,
+            len(audio_tracks),
+            time.perf_counter() - render_started,
+        )
+
+    try:
+        if cancel_event is not None and cancel_event.is_set():
+            raise PreviewRenderCancelled("Se canceló la generación de preview.")
+        if not final_path.is_file() or final_path.stat().st_size == 0:
+            raise PreviewRenderError(
+                f"ffmpeg no generó una preview válida para {video_path.name}."
+            )
+    except (PreviewRenderCancelled, PreviewRenderError) as error:
+        _remove_partial_output(final_path, error)
+        raise
+    return final_path
+
+
+def _run_ffmpeg(
+    command: list[str],
+    video_path: Path,
+    cancel_event: threading.Event | None,
+) -> None:
     try:
         with subprocess.Popen(
             command,
@@ -120,30 +199,22 @@ def render_playback_proxy(
                     continue
             if process.returncode != 0:
                 detail = stderr.strip() or f"ffmpeg devolvió código {process.returncode}"
-                raise PreviewRenderError(
+                raise _FFmpegEncodingError(
                     f"No se pudo preparar la preview de {video_path.name}: {detail}"
                 )
-    except (PreviewRenderCancelled, PreviewRenderError) as error:
-        _remove_partial_output(output_path, error)
+    except (PreviewRenderCancelled, PreviewRenderError):
         raise
     except FileNotFoundError as error:
-        _remove_partial_output(output_path, error)
         raise PreviewRenderError("No se encontró ffmpeg en PATH.") from error
     except OSError as error:
-        _remove_partial_output(output_path, error)
         raise PreviewRenderError(f"No se pudo ejecutar ffmpeg: {error}") from error
 
-    try:
-        if cancel_event is not None and cancel_event.is_set():
-            raise PreviewRenderCancelled("Se canceló la generación de preview.")
-        if not output_path.is_file() or output_path.stat().st_size == 0:
-            raise PreviewRenderError(
-                f"ffmpeg no generó una preview válida para {video_path.name}."
-            )
-    except (PreviewRenderCancelled, PreviewRenderError) as error:
-        _remove_partial_output(output_path, error)
-        raise
-    return output_path
+
+def _validate_output(output_path: Path, video_path: Path) -> None:
+    if not output_path.is_file() or output_path.stat().st_size == 0:
+        raise PreviewRenderError(
+            f"ffmpeg no generó una preview válida para {video_path.name}."
+        )
 
 
 def _remove_partial_output(output_path: Path, cause: Exception) -> None:

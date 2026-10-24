@@ -70,8 +70,8 @@ class PlaybackProxyTests(unittest.TestCase):
             ) as popen:
                 result = render_playback_proxy(video, audio, output)
 
-            self.assertEqual(result, output)
-            self.assertEqual(output.read_bytes(), b"preview")
+            self.assertEqual(result, output.with_name("preview-copy.mov"))
+            self.assertEqual(result.read_bytes(), b"preview")
             command = popen.call_args.args[0]
             self.assertIn("0.080000000", command)
             self.assertTrue(
@@ -80,7 +80,9 @@ class PlaybackProxyTests(unittest.TestCase):
                     for argument in command
                 )
             )
-            self.assertIn("mpeg4", command)
+            self.assertIn("copy", command)
+            self.assertNotIn("-vf", command)
+            self.assertEqual(result.suffix, ".mov")
             self.assertIn("aac", command)
 
     def test_proxy_rejects_unmeasured_audio_offsets(self) -> None:
@@ -120,9 +122,52 @@ class PlaybackProxyTests(unittest.TestCase):
                         root / "preview.mp4",
                     )
 
+    def test_copy_failure_falls_back_to_scaled_mpeg4_and_keeps_audio(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            video = root / "video.mxf"
+            audio = (
+                AudioSync(
+                    path=root / "audio00.mxf",
+                    offset_seconds=Fraction(0),
+                    timecode_offset_seconds=Fraction(0),
+                    timecode="00:00:00:00",
+                    duration_seconds=Fraction(10),
+                ),
+            )
+            attempts: list[list[str]] = []
+
+            def fail_copy_then_transcode(
+                command: list[str],
+                **kwargs: object,
+            ) -> _SuccessfulProcess:
+                attempts.append(command)
+                if len(attempts) == 1:
+                    return self._failed_process(command, kwargs)
+                return self._successful_process(command, kwargs)
+
+            with patch(
+                "p2viewer.playback.subprocess.Popen",
+                side_effect=fail_copy_then_transcode,
+            ):
+                result = render_playback_proxy(
+                    video,
+                    audio,
+                    root / "preview.mp4",
+                )
+
+            self.assertEqual(result.suffix, ".mp4")
+            self.assertEqual(len(attempts), 2)
+            transcode_command = attempts[1]
+            self.assertIn("mpeg4", transcode_command)
+            self.assertIn("aac", transcode_command)
+
     @staticmethod
-    def _successful_process(command: list[str], kwargs: dict[str, object]) -> _SuccessfulProcess:
-        if set(kwargs) != {"stdout", "stderr", "text"}:
+    def _successful_process(
+        command: list[str],
+        kwargs: dict[str, object],
+    ) -> _SuccessfulProcess:
+        if kwargs and set(kwargs) != {"stdout", "stderr", "text"}:
             raise AssertionError(f"Unexpected Popen options: {kwargs}")
         return _SuccessfulProcess(command)
 

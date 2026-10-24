@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 import sys
 import tempfile
 import threading
+import time
 import uuid
+from collections import OrderedDict
 from pathlib import Path
 
 from PySide6.QtCore import QThread, QTimer, QUrl, Qt, Signal, Slot
@@ -38,11 +41,20 @@ from p2viewer.playback import (
 )
 from p2viewer.synchronization import (
     AudioSync,
+    SYNC_ANALYSIS_MAX_WORKERS,
     SyncAnalysis,
-    analyze_clip_sync,
-    build_synced_mxf,
-    mxf_output_name,
+    analyze_clips_sync,
 )
+
+logger = logging.getLogger(__name__)
+PREVIEW_CACHE_MAX_ENTRIES = 4
+PREVIEW_CACHE_MAX_BYTES = 512 * 1024 * 1024
+
+PreviewCacheKey = tuple[
+    tuple[str, int, int],
+    tuple[tuple[str, int, int, str], ...],
+]
+
 
 class _PlaybackProxyThread(QThread):
     completed = Signal(str, str, str)
@@ -67,8 +79,9 @@ class _PlaybackProxyThread(QThread):
 
     def run(self) -> None:
         error_message = ""
+        rendered_path = self._output_path
         try:
-            render_playback_proxy(
+            rendered_path = render_playback_proxy(
                 self._video_path,
                 self._audio_tracks,
                 self._output_path,
@@ -78,7 +91,7 @@ class _PlaybackProxyThread(QThread):
             pass
         except (OSError, ValueError, PreviewRenderError) as error:
             error_message = str(error)
-        self.completed.emit(self._token, str(self._output_path), error_message)
+        self.completed.emit(self._token, str(rendered_path), error_message)
 
 
 class _ScanThread(QThread):
@@ -102,6 +115,7 @@ class _ScanThread(QThread):
             self.progress.emit(directories, found, str(current))
 
         try:
+            stage_started = time.perf_counter()
             for media in iter_media(self._folder, report_progress):
                 batch.append(media)
                 scanned_paths.append(media.path)
@@ -111,20 +125,50 @@ class _ScanThread(QThread):
                     batch = []
             if batch:
                 self.batch_ready.emit(batch)
+            logger.info(
+                "Directory scan completed: files=%d elapsed=%.3fs",
+                files_found,
+                time.perf_counter() - stage_started,
+            )
+
+            stage_started = time.perf_counter()
             p2_metadata = scan_p2_metadata(
                 self._folder,
                 (path for path in scanned_paths if path.suffix.casefold() == ".mxf"),
             )
             self.p2_metadata_ready.emit(p2_metadata)
-            sync_analyses: list[SyncAnalysis] = []
-            for index, clip in enumerate(p2_metadata.clips, start=1):
+            logger.info(
+                "P2 metadata scan completed: clips=%d elapsed=%.3fs",
+                len(p2_metadata.clips),
+                time.perf_counter() - stage_started,
+            )
+
+            stage_started = time.perf_counter()
+
+            def report_sync_progress(
+                completed: int,
+                total: int,
+                analysis: SyncAnalysis,
+            ) -> None:
                 self.progress.emit(
-                    index,
-                    len(p2_metadata.clips),
-                    f"Midiendo sincronía P2: {clip.clip_id}",
+                    completed,
+                    total,
+                    f"Midiendo sincronía P2: {analysis.clip.clip_id}",
                 )
-                sync_analyses.append(analyze_clip_sync(clip))
+
+            sync_started = time.perf_counter()
+            sync_analyses = analyze_clips_sync(
+                p2_metadata.clips,
+                report_sync_progress,
+            )
             self.sync_analysis_ready.emit(sync_analyses)
+            logger.info(
+                "P2 synchronization analysis completed: clips=%d workers=%d "
+                "elapsed=%.3fs",
+                len(sync_analyses),
+                min(SYNC_ANALYSIS_MAX_WORKERS, len(sync_analyses)),
+                time.perf_counter() - sync_started,
+            )
             self.scan_finished.emit(files_found)
         except (OSError, OverflowError, ValueError) as error:
             if batch:
@@ -132,56 +176,27 @@ class _ScanThread(QThread):
             self.failed.emit(str(error))
 
 
-class _BuildThread(QThread):
-    progress = Signal(int, int, str)
-    item_finished = Signal(str, bool, str)
-    build_finished = Signal(int, int)
-
-    def __init__(
-        self,
-        analyses: list[SyncAnalysis],
-        output_directory: Path,
-        parent: QWidget,
-    ) -> None:
-        super().__init__(parent)
-        self._analyses = analyses
-        self._output_directory = output_directory
-
-    def run(self) -> None:
-        succeeded = 0
-        failed = 0
-        for index, analysis in enumerate(self._analyses, start=1):
-            clip_id = analysis.clip.clip_id
-            self.progress.emit(index, len(self._analyses), clip_id)
-            try:
-                result = build_synced_mxf(analysis, self._output_directory)
-            except (OSError, ValueError, RuntimeError) as error:
-                failed += 1
-                self.item_finished.emit(clip_id, False, str(error))
-            else:
-                succeeded += 1
-                self.item_finished.emit(clip_id, True, str(result.output_path))
-        self.build_finished.emit(succeeded, failed)
-
-
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("P2Viewer Plus - Python reconstruction")
-        self.resize(1000, 640)
+        self.resize(1600, 800)
         self._thread: QThread | None = None
         self._media: list[MediaFile] = []
         self._p2_warnings: tuple[str, ...] = ()
         self._p2_result = P2ScanResult({}, (), ())
         self._clip_assemblies: list[ClipAssembly] = []
         self._sync_by_video: dict[Path, SyncAnalysis] = {}
-        self._scanned_folder: Path | None = None
-        self._build_thread: _BuildThread | None = None
-        self._build_results: list[tuple[str, bool, str]] = []
         self._preview_render_thread: _PlaybackProxyThread | None = None
         self._preview_render_result: tuple[str, str, str] | None = None
         self._wanted_playback: tuple[str, Path, tuple[AudioSync, ...]] | None = None
         self._active_preview_path: Path | None = None
+        self._preview_requested_at: float | None = None
+        self._preview_render_finished_at: float | None = None
+        self._active_preview_token: str | None = None
+        self._preview_ready_logged_token: str | None = None
+        self._preview_cache: OrderedDict[PreviewCacheKey, Path] = OrderedDict()
+        self._preview_cache_keys_by_token: dict[str, PreviewCacheKey] = {}
         self._preview_temp_dir = tempfile.TemporaryDirectory(prefix="p2viewer-preview-")
         self._closing_after_preview = False
 
@@ -212,7 +227,7 @@ class MainWindow(QMainWindow):
         self._player = QMediaPlayer(self)
         self._player.setAudioOutput(self._audio_output)
         self._preview_video = QVideoWidget()
-        self._preview_video.setMinimumSize(300, 220)
+        self._preview_video.setFixedSize(600, 400)
         self._preview_video.setStyleSheet("QVideoWidget { background-color: #171717; }")
         self._player.setVideoOutput(self._preview_video)
         self._player.positionChanged.connect(self._playback_position_changed)
@@ -262,6 +277,7 @@ class MainWindow(QMainWindow):
         preview_panel = QWidget()
         preview_layout = QVBoxLayout(preview_panel)
         preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.addWidget(QLabel("Video Preview"))
         preview_layout.addWidget(self._preview_video, 1)
         preview_layout.addLayout(preview_controls)
         preview_layout.addWidget(self._preview_status)
@@ -269,10 +285,6 @@ class MainWindow(QMainWindow):
         self._preview_render_timer = QTimer(self)
         self._preview_render_timer.setSingleShot(True)
         self._preview_render_timer.timeout.connect(self._start_playback_render)
-
-        self._build_button = QPushButton("Construir MXF sincronizados...")
-        self._build_button.setEnabled(False)
-        self._build_button.clicked.connect(self._choose_build_folder)
 
         self._details = QTextEdit()
         self._details.setReadOnly(True)
@@ -283,22 +295,32 @@ class MainWindow(QMainWindow):
         controls = QHBoxLayout()
         controls.addWidget(self._scan_button)
         controls.addWidget(self._folder_label, 1)
-        controls.addWidget(self._build_button)
 
-        splitter = QSplitter()
-        splitter.addWidget(self._clip_table)
+        clips_panel = QWidget()
+        clips_layout = QVBoxLayout(clips_panel)
+        clips_layout.setContentsMargins(0, 0, 0, 0)
+        clips_layout.addWidget(QLabel("Clips"))
+        clips_layout.addWidget(self._clip_table, 1)
+
         details_panel = QWidget()
         details_layout = QVBoxLayout(details_panel)
         details_layout.setContentsMargins(0, 0, 0, 0)
-        details_layout.addWidget(preview_panel, 1)
+        details_layout.addWidget(QLabel("Información y sincronía"))
         details_layout.addWidget(self._details, 1)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(clips_panel)
+        splitter.addWidget(preview_panel)
         splitter.addWidget(details_panel)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 0)
+        splitter.setStretchFactor(2, 1)
+        splitter.setSizes([450, 640, 450])
 
         status_note = QLabel(
             "La preview reproduce video y mezcla el audio P2 solo si su sincronía "
-            "fue verificada. La construcción genera MXF sin recodificar las fuentes."
+            "fue verificada."
         )
         status_note.setWordWrap(True)
 
@@ -323,10 +345,8 @@ class MainWindow(QMainWindow):
             return
 
         self._folder_label.setText(str(folder))
-        self._scanned_folder = folder.expanduser().resolve()
         self._scan_button.setEnabled(False)
         self._scan_button.setText("Escaneando...")
-        self._build_button.setEnabled(False)
         self._details.clear()
         self._media.clear()
         self._p2_warnings = ()
@@ -393,6 +413,10 @@ class MainWindow(QMainWindow):
         if self._preview_render_thread is not None:
             self._preview_render_thread.cancel()
 
+        self._preview_requested_at = time.perf_counter()
+        self._preview_render_finished_at = None
+        self._active_preview_token = None
+        self._preview_ready_logged_token = None
         self._player.stop()
         self._player.setSource(QUrl())
         self._remove_active_preview_file()
@@ -426,6 +450,10 @@ class MainWindow(QMainWindow):
 
     def _clear_playback_preview(self, status: str) -> None:
         self._wanted_playback = None
+        self._preview_requested_at = None
+        self._preview_render_finished_at = None
+        self._active_preview_token = None
+        self._preview_ready_logged_token = None
         self._preview_render_timer.stop()
         if self._preview_render_thread is not None:
             self._preview_render_thread.cancel()
@@ -444,7 +472,8 @@ class MainWindow(QMainWindow):
     def _remove_active_preview_file(self) -> None:
         path = self._active_preview_path
         self._active_preview_path = None
-        if path is not None and path.exists():
+        is_cached = path is not None and path in self._preview_cache.values()
+        if path is not None and not is_cached and path.exists():
             try:
                 path.unlink()
             except OSError as error:
@@ -460,7 +489,29 @@ class MainWindow(QMainWindow):
         ):
             return
         token, video_path, audio_tracks = self._wanted_playback
+        try:
+            cache_key = self._preview_cache_key(video_path, audio_tracks)
+        except OSError as error:
+            self._preview_status.setText(
+                f"No se pudo comprobar el archivo para la preview: {error}"
+            )
+            return
+
+        cached_path = self._preview_cache.get(cache_key)
+        if cached_path is not None:
+            try:
+                is_valid = cached_path.is_file() and cached_path.stat().st_size > 0
+            except OSError:
+                is_valid = False
+            if is_valid:
+                self._preview_cache.move_to_end(cache_key)
+                logger.info("Preview cache hit: video=%s", video_path.name)
+                self._activate_playback_preview(token, cached_path, cache_hit=True)
+                return
+            self._preview_cache.pop(cache_key)
+
         output_path = Path(self._preview_temp_dir.name) / f"{token}.mp4"
+        self._preview_cache_keys_by_token[token] = cache_key
         thread = _PlaybackProxyThread(
             token,
             video_path,
@@ -474,6 +525,54 @@ class MainWindow(QMainWindow):
         self._preview_render_result = None
         self._preview_render_thread = thread
         thread.start()
+
+    @staticmethod
+    def _preview_cache_key(
+        video_path: Path,
+        audio_tracks: tuple[AudioSync, ...],
+    ) -> PreviewCacheKey:
+        video_stat = video_path.stat()
+        video_signature = (
+            str(video_path.resolve()),
+            video_stat.st_size,
+            video_stat.st_mtime_ns,
+        )
+        audio_signatures = []
+        for track in audio_tracks:
+            audio_stat = track.path.stat()
+            audio_signatures.append(
+                (
+                    str(track.path.resolve()),
+                    audio_stat.st_size,
+                    audio_stat.st_mtime_ns,
+                    str(track.timecode_offset_seconds),
+                )
+            )
+        return video_signature, tuple(audio_signatures)
+
+    def _cache_preview(self, key: PreviewCacheKey, path: Path) -> None:
+        preview_size = path.stat().st_size
+        if preview_size > PREVIEW_CACHE_MAX_BYTES:
+            logger.info(
+                "Preview not cached: video proxy is larger than cache limit "
+                "(size_mb=%.2f limit_mb=%.2f)",
+                preview_size / (1024 * 1024),
+                PREVIEW_CACHE_MAX_BYTES / (1024 * 1024),
+            )
+            return
+        self._preview_cache[key] = path
+        self._preview_cache.move_to_end(key)
+        while (
+            len(self._preview_cache) > PREVIEW_CACHE_MAX_ENTRIES
+            or sum(
+                cached_path.stat().st_size
+                for cached_path in self._preview_cache.values()
+            )
+            > PREVIEW_CACHE_MAX_BYTES
+        ):
+            _, evicted_path = self._preview_cache.popitem(last=False)
+            if evicted_path != self._active_preview_path:
+                self._delete_preview_file(evicted_path)
 
     @Slot(str, str, str)
     def _capture_playback_render_result(
@@ -498,18 +597,15 @@ class MainWindow(QMainWindow):
                 else None
             )
             if self._closing_after_preview:
+                self._preview_cache_keys_by_token.pop(token, None)
                 self._delete_preview_file(output_path)
             elif token == wanted_token and not error:
-                self._active_preview_path = output_path
-                self._player.setSource(QUrl.fromLocalFile(str(output_path)))
-                audio_count = len(self._wanted_playback[2]) if self._wanted_playback else 0
-                self._preview_status.setText(
-                    "Preview lista: video con mezcla de "
-                    f"{audio_count} pista(s) sincronizada(s)."
-                    if audio_count
-                    else "Preview lista: reproducción de video sin audio verificado."
-                )
+                cache_key = self._preview_cache_keys_by_token.pop(token, None)
+                if cache_key is not None:
+                    self._cache_preview(cache_key, output_path)
+                self._activate_playback_preview(token, output_path, cache_hit=False)
             else:
+                self._preview_cache_keys_by_token.pop(token, None)
                 self._delete_preview_file(output_path)
                 if token == wanted_token and error:
                     self._preview_status.setText(error)
@@ -519,6 +615,36 @@ class MainWindow(QMainWindow):
 
         if self._closing_after_preview:
             QTimer.singleShot(0, self.close)
+
+    def _activate_playback_preview(
+        self,
+        token: str,
+        output_path: Path,
+        *,
+        cache_hit: bool,
+    ) -> None:
+        self._active_preview_path = output_path
+        self._preview_render_finished_at = time.perf_counter()
+        wanted_playback = self._wanted_playback
+        if wanted_playback is None:
+            return
+        if self._preview_requested_at is not None:
+            logger.info(
+                "Preview proxy ready: video=%s elapsed_since_selection=%.3fs "
+                "cache_hit=%s",
+                wanted_playback[1].name,
+                self._preview_render_finished_at - self._preview_requested_at,
+                cache_hit,
+            )
+        self._active_preview_token = token
+        self._player.setSource(QUrl.fromLocalFile(str(output_path)))
+        audio_count = len(wanted_playback[2])
+        self._preview_status.setText(
+            "Preview lista: video con mezcla de "
+            f"{audio_count} pista(s) sincronizada(s)."
+            if audio_count
+            else "Preview lista: reproducción de video sin audio verificado."
+        )
 
     def _delete_preview_file(self, path: Path) -> None:
         if not path.exists():
@@ -586,9 +712,42 @@ class MainWindow(QMainWindow):
             QMediaPlayer.MediaStatus.BufferedMedia,
             QMediaPlayer.MediaStatus.EndOfMedia,
         )
+        if (
+            status in (
+                QMediaPlayer.MediaStatus.LoadedMedia,
+                QMediaPlayer.MediaStatus.BufferedMedia,
+            )
+            and self._active_preview_token is not None
+            and self._active_preview_token != self._preview_ready_logged_token
+        ):
+            self._preview_ready_logged_token = self._active_preview_token
+            now = time.perf_counter()
+            requested_at = self._preview_requested_at
+            render_finished_at = self._preview_render_finished_at
+            if requested_at is not None and render_finished_at is not None:
+                logger.info(
+                    "Preview playable: video=%s status=%s proxy_elapsed=%.3fs "
+                    "player_load_elapsed=%.3fs total_elapsed=%.3fs",
+                    self._wanted_playback[1].name if self._wanted_playback else "unknown",
+                    status.name,
+                    render_finished_at - requested_at,
+                    now - render_finished_at,
+                    now - requested_at,
+                )
         self._play_button.setEnabled(ready)
         self._stop_button.setEnabled(ready)
         if status == QMediaPlayer.MediaStatus.InvalidMedia:
+            if (
+                self._preview_requested_at is not None
+                and self._wanted_playback is not None
+            ):
+                logger.warning(
+                    "Preview player failed: video=%s elapsed_since_selection=%.3fs "
+                    "error=%s",
+                    self._wanted_playback[1].name,
+                    time.perf_counter() - self._preview_requested_at,
+                    self._player.errorString(),
+                )
             self._preview_status.setText(
                 "El reproductor no pudo abrir la preview: "
                 f"{self._player.errorString()}"
@@ -609,7 +768,7 @@ class MainWindow(QMainWindow):
         self._populate_clip_table()
         if files_found:
             p2_matches = len(self._p2_result.by_media_path)
-            eligible = sum(
+            verified = sum(
                 1 for analysis in self._sync_by_video.values() if analysis.eligible
             )
             warning_text = (
@@ -619,8 +778,8 @@ class MainWindow(QMainWindow):
             )
             self.statusBar().showMessage(
                 f"Escaneo completo: {files_found} archivos de medios, "
-                f"{p2_matches} esencias P2, {eligible} clips listos para "
-                f"construcción{warning_text}"
+                f"{p2_matches} esencias P2, sincronía verificada en "
+                f"{verified} clips{warning_text}"
             )
             return
 
@@ -642,9 +801,6 @@ class MainWindow(QMainWindow):
     def _scan_thread_finished(self) -> None:
         self._scan_button.setEnabled(True)
         self._scan_button.setText("Elegir carpeta...")
-        self._build_button.setEnabled(
-            any(analysis.eligible for analysis in self._sync_by_video.values())
-        )
         self._thread = None
 
     def _populate_clip_table(self) -> None:
@@ -664,9 +820,9 @@ class MainWindow(QMainWindow):
                 else:
                     offset = "No medido"
                 if sync is not None and sync.eligible:
-                    status = "Listo; MXF sin recodificar"
+                    status = "Sincronía verificada"
                 elif sync is not None and sync.issues:
-                    status = f"Bloqueado: {sync.issues[0]}"
+                    status = f"Sin verificar: {sync.issues[0]}"
                 elif metadata.audio_track_count > len(assembly.audio_files):
                     status = "Faltan esencias de audio"
                 elif not assembly.audio_files:
@@ -721,7 +877,7 @@ class MainWindow(QMainWindow):
             duration,
         )
         details = [
-            "Vista previa de construcción MXF.",
+            "Información y sincronía del clip.",
             f"Video: {assembly.video.path}",
         ]
         if metadata is None:
@@ -729,7 +885,7 @@ class MainWindow(QMainWindow):
                 (
                     "",
                     "No se encontró metadata P2 que asocie este video "
-                    "con pistas de audio; no se puede construir el clip.",
+                    "con pistas de audio.",
                 )
             )
         else:
@@ -769,197 +925,18 @@ class MainWindow(QMainWindow):
                     f"timecode {track.timecode or 'no disponible'}"
                 )
             details.append(
-                "Estado: listo para construir."
+                "Estado: sincronía verificada."
                 if sync.eligible
-                else "Estado: construcción bloqueada por verificaciones pendientes."
+                else "Estado: sincronía no verificada."
             )
             details.extend(f"- {issue}" for issue in sync.issues)
         else:
             details.extend(("", "La sincronía todavía no fue medida."))
 
-        details.extend(
-            (
-                "",
-                "La salida será un MXF nuevo con copia de los streams, sin "
-                "recodificación. Los originales no se modifican.",
-            )
-        )
         if self._p2_warnings:
             details.extend(("", "Advertencias de lectura P2:"))
             details.extend(f"- {warning}" for warning in self._p2_warnings[:10])
         self._details.setPlainText("\n".join(details))
-
-    @Slot()
-    def _choose_build_folder(self) -> None:
-        eligible = [
-            analysis
-            for analysis in self._sync_by_video.values()
-            if analysis.eligible
-        ]
-        if not eligible:
-            QMessageBox.information(
-                self,
-                "No hay clips listos",
-                "No hay clips que hayan superado las verificaciones P2 de "
-                "timecode, UMID, streams y duración.",
-            )
-            return
-
-        start_directory = (
-            str(self._scanned_folder.parent)
-            if self._scanned_folder is not None
-            else str(Path.home())
-        )
-        directory = QFileDialog.getExistingDirectory(
-            self,
-            "Elegir carpeta de salida MXF",
-            start_directory,
-        )
-        if not directory:
-            return
-
-        output_directory = Path(directory).expanduser().resolve()
-        if self._scanned_folder is not None and output_directory.is_relative_to(
-            self._scanned_folder
-        ):
-            QMessageBox.warning(
-                self,
-                "Elegir una carpeta fuera de la tarjeta",
-                "Para proteger los archivos originales, la carpeta de salida "
-                "debe estar fuera de la carpeta P2 analizada.",
-            )
-            return
-
-        buildable: list[SyncAnalysis] = []
-        lines = [
-            "Se crearán MXF nuevos copiando los streams, sin recodificar.",
-            "Los originales no se modifican. Las salidas existentes se omiten.",
-            "",
-            "Desfases medidos (audio respecto de video):",
-        ]
-        reserved_names: set[str] = set()
-        for analysis in eligible:
-            try:
-                output_name = mxf_output_name(analysis.clip.clip_id)
-            except ValueError as error:
-                lines.append(f"- {analysis.clip.clip_id}: omitido; {error}")
-                continue
-            if output_name.casefold() in reserved_names:
-                lines.append(
-                    f"- {analysis.clip.clip_id}: omitido; nombre de salida duplicado."
-                )
-                continue
-            reserved_names.add(output_name.casefold())
-            output_path = output_directory / output_name
-            if output_path.exists():
-                lines.append(f"- {analysis.clip.clip_id}: omitido; ya existe la salida.")
-                continue
-            buildable.append(analysis)
-            video_name = (
-                analysis.clip.video_file.name
-                if analysis.clip.video_file is not None
-                else "video no disponible"
-            )
-            offsets = ", ".join(
-                f"{track.path.name} {float(track.offset_seconds):+.6f} s"
-                for track in analysis.audio
-                if track.offset_seconds is not None
-            )
-            lines.append(
-                f"- {analysis.clip.clip_id}: {video_name} + "
-                f"{len(analysis.audio)} pistas; {offsets}; "
-                f"salida {output_path.name}"
-            )
-
-        blocked_count = len(self._sync_by_video) - len(eligible)
-        if blocked_count:
-            lines.extend(
-                (
-                    "",
-                    f"{blocked_count} clip(s) no pasan las validaciones y "
-                    "no se construirán.",
-                )
-            )
-        if not buildable:
-            QMessageBox.information(
-                self,
-                "No hay salidas nuevas",
-                "Todas las salidas correspondientes ya existen.",
-            )
-            return
-
-        confirmation = QMessageBox(self)
-        confirmation.setWindowTitle("Vista previa de construcción")
-        confirmation.setText(
-            f"¿Construir {len(buildable)} clip(s) MXF nuevos en:\n"
-            f"{output_directory}?"
-        )
-        confirmation.setDetailedText("\n".join(lines))
-        confirmation.setStandardButtons(
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        confirmation.setDefaultButton(QMessageBox.StandardButton.No)
-        answer = confirmation.exec()
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-
-        self._start_build(buildable, output_directory)
-
-    def _start_build(
-        self,
-        analyses: list[SyncAnalysis],
-        output_directory: Path,
-    ) -> None:
-        if self._build_thread is not None:
-            return
-        self._build_button.setEnabled(False)
-        self._scan_button.setEnabled(False)
-        self._build_results.clear()
-
-        thread = _BuildThread(analyses, output_directory, self)
-        thread.progress.connect(self._update_build_progress)
-        thread.item_finished.connect(self._record_build_result)
-        thread.build_finished.connect(self._build_finished)
-        thread.finished.connect(self._build_thread_finished)
-        self._build_thread = thread
-        thread.start()
-
-    @Slot(int, int, str)
-    def _update_build_progress(self, index: int, total: int, clip_id: str) -> None:
-        self.statusBar().showMessage(
-            f"Construyendo {clip_id}: clip {index} de {total}..."
-        )
-
-    @Slot(str, bool, str)
-    def _record_build_result(self, clip_id: str, success: bool, detail: str) -> None:
-        self._build_results.append((clip_id, success, detail))
-
-    @Slot(int, int)
-    def _build_finished(self, succeeded: int, failed: int) -> None:
-        self.statusBar().showMessage(
-            f"Construcción finalizada: {succeeded} correcto(s), {failed} error(es)"
-        )
-        lines = [
-            f"{clip_id}: {'creado' if success else 'error'} — {detail}"
-            for clip_id, success, detail in self._build_results
-        ]
-        result_dialog = QMessageBox(self)
-        result_dialog.setIcon(QMessageBox.Icon.Information)
-        result_dialog.setWindowTitle("Construcción finalizada")
-        result_dialog.setText(
-            f"MXF creados: {succeeded}. Errores: {failed}."
-        )
-        result_dialog.setDetailedText("\n".join(lines))
-        result_dialog.setStandardButtons(QMessageBox.StandardButton.Ok)
-        result_dialog.exec()
-
-    @Slot()
-    def _build_thread_finished(self) -> None:
-        self._build_thread = None
-        self._scan_button.setEnabled(True)
-        self._build_button.setEnabled(
-            any(analysis.eligible for analysis in self._sync_by_video.values())
-        )
 
     @staticmethod
     def _format_p2_duration(metadata: P2ClipMetadata) -> str:
@@ -1001,11 +978,17 @@ class MainWindow(QMainWindow):
         self._player.stop()
         self._player.setSource(QUrl())
         self._preview_temp_dir.cleanup()
+        self._preview_cache.clear()
+        self._preview_cache_keys_by_token.clear()
         event.accept()
         super().closeEvent(event)
 
 
 def main() -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()

@@ -46,14 +46,37 @@ class SynchronizationTests(unittest.TestCase):
         start_time: str = "0",
         duration: str = "10",
     ) -> dict[str, object]:
-        return {
-            "streams": [
+        stream: dict[str, object] = {
+            "codec_type": media_kind,
+            "start_time": start_time,
+            "duration": duration,
+        }
+        if media_kind == "video":
+            stream.update(
                 {
-                    "codec_type": media_kind,
-                    "start_time": start_time,
-                    "duration": duration,
+                    "codec_name": "dvvideo",
+                    "codec_long_name": "DV (Digital Video)",
+                    "width": 1440,
+                    "height": 1080,
+                    "avg_frame_rate": "25/1",
+                    "pix_fmt": "yuv422p10le",
+                    "field_order": "tt",
+                    "bit_rate": "115200000",
                 }
-            ],
+            )
+        else:
+            stream.update(
+                {
+                    "codec_name": "pcm_s16le",
+                    "codec_long_name": "PCM signed 16-bit little-endian",
+                    "sample_rate": "48000",
+                    "channels": 2,
+                    "channel_layout": "stereo",
+                    "bit_rate": "1536000",
+                }
+            )
+        return {
+            "streams": [stream],
             "format": {
                 "tags": {
                     "timecode": timecode,
@@ -140,6 +163,15 @@ class SynchronizationTests(unittest.TestCase):
             self.assertTrue(analysis.eligible, analysis.issues)
             self.assertEqual(analysis.audio[0].timecode_offset_seconds, Fraction(2, 25))
             self.assertEqual(analysis.audio[0].offset_seconds, Fraction(2, 25))
+            assert analysis.video_properties is not None
+            assert analysis.audio_properties[0] is not None
+            self.assertEqual(analysis.video_properties.codec_name, "dvvideo")
+            self.assertEqual(analysis.video_properties.width, "1440")
+            self.assertEqual(analysis.video_properties.height, "1080")
+            self.assertEqual(
+                analysis.audio_properties[0].sample_rate,
+                "48000",
+            )
 
     def test_builder_applies_measured_offset_and_verifies_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

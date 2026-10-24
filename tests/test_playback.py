@@ -9,6 +9,7 @@ from unittest.mock import patch
 from p2viewer.playback import (
     PreviewRenderError,
     render_playback_proxy,
+    render_preview_audio,
     render_preview_thumbnail,
 )
 from p2viewer.synchronization import AudioSync
@@ -43,6 +44,68 @@ class _FailedProcess(_SuccessfulProcess):
 
 
 class PlaybackProxyTests(unittest.TestCase):
+    def test_audio_mix_rejects_unmeasured_offsets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            track = AudioSync(
+                Path(temporary_directory) / "audio.mxf",
+                Fraction(0),
+                None,
+                None,
+                Fraction(10),
+            )
+            with patch("p2viewer.playback._run_ffmpeg") as run_ffmpeg:
+                with self.assertRaisesRegex(ValueError, "desfases desconocidos"):
+                    render_preview_audio(
+                        (track,),
+                        Path(temporary_directory) / "audio.wav",
+                    )
+            run_ffmpeg.assert_not_called()
+
+    def test_audio_mix_applies_positive_and_negative_offsets_without_video(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            audio_tracks = (
+                AudioSync(
+                    root / "audio00.mxf",
+                    Fraction(0),
+                    Fraction(2, 25),
+                    "00:00:00:02",
+                    Fraction(10),
+                ),
+                AudioSync(
+                    root / "audio01.mxf",
+                    Fraction(0),
+                    Fraction(-1, 25),
+                    "23:59:59:24",
+                    Fraction(10),
+                ),
+            )
+            output = root / "audio-mix.wav"
+
+            def write_audio_mix(
+                command: list[str],
+                video_path: Path,
+                cancel_event: object,
+            ) -> None:
+                del video_path, cancel_event
+                Path(command[-1]).write_bytes(b"wav")
+
+            with patch(
+                "p2viewer.playback._run_ffmpeg",
+                side_effect=write_audio_mix,
+            ) as run_ffmpeg:
+                result = render_preview_audio(audio_tracks, output)
+
+            self.assertEqual(result, output)
+            self.assertEqual(output.read_bytes(), b"wav")
+            command = run_ffmpeg.call_args.args[0]
+            filter_complex = command[command.index("-filter_complex") + 1]
+            self.assertIn("adelay=3840S:all=1", filter_complex)
+            self.assertIn("atrim=start=0.040000000", filter_complex)
+            self.assertIn("amix=inputs=2", filter_complex)
+            self.assertIn("pcm_s16le", command)
+            self.assertEqual(command.count("-i"), len(audio_tracks))
+
     def test_thumbnail_extracts_one_scaled_frame(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

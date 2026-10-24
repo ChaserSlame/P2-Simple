@@ -25,6 +25,84 @@ class _FFmpegEncodingError(PreviewRenderError):
     pass
 
 
+def render_preview_audio(
+    audio_tracks: tuple[AudioSync, ...],
+    output_path: Path,
+    ffmpeg: str = "ffmpeg",
+    cancel_event: threading.Event | None = None,
+) -> Path:
+    """Mix verified P2 audio to PCM without remuxing or transcoding the video."""
+    if not audio_tracks:
+        raise ValueError("Se necesita al menos una pista de audio para la mezcla.")
+    offsets = [track.timecode_offset_seconds for track in audio_tracks]
+    if any(offset is None for offset in offsets):
+        raise ValueError("No se puede previsualizar audio con desfases desconocidos.")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    render_started = time.perf_counter()
+    command = [
+        ffmpeg,
+        "-nostdin",
+        "-hide_banner",
+        "-y",
+        "-loglevel",
+        "error",
+    ]
+    command.extend(
+        argument
+        for track in audio_tracks
+        for argument in ("-i", str(track.path))
+    )
+    filters: list[str] = []
+    for index, offset in enumerate(offsets):
+        assert offset is not None
+        trim_start = max(0.0, -float(offset))
+        delay_samples = max(0, round(float(offset) * 48_000))
+        filter_chain = (
+            f"[{index}:a:0]atrim=start={trim_start:.9f},"
+            "asetpts=PTS-STARTPTS"
+        )
+        if delay_samples:
+            filter_chain += f",adelay={delay_samples}S:all=1"
+        filters.append(f"{filter_chain}[a{index}]")
+    audio_inputs = "".join(f"[a{index}]" for index in range(len(audio_tracks)))
+    filters.append(
+        f"{audio_inputs}amix=inputs={len(audio_tracks)}:"
+        "duration=longest:dropout_transition=0:normalize=1,"
+        "aresample=48000,aformat=sample_fmts=s16:"
+        "sample_rates=48000:channel_layouts=stereo[aout]"
+    )
+    command.extend(
+        (
+            "-filter_complex",
+            ";".join(filters),
+            "-map",
+            "[aout]",
+            "-vn",
+            "-c:a",
+            "pcm_s16le",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            str(output_path),
+        )
+    )
+    try:
+        _run_ffmpeg(command, audio_tracks[0].path, cancel_event)
+        _validate_output(output_path, audio_tracks[0].path)
+    except (PreviewRenderCancelled, PreviewRenderError) as error:
+        _remove_partial_output(output_path, error)
+        raise
+    logger.info(
+        "Preview audio mix completed: tracks=%d elapsed=%.3fs size_mb=%.2f",
+        len(audio_tracks),
+        time.perf_counter() - render_started,
+        output_path.stat().st_size / (1024 * 1024),
+    )
+    return output_path
+
+
 def render_preview_thumbnail(
     video_path: Path,
     output_path: Path,

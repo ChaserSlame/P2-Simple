@@ -32,12 +32,29 @@ class AudioSync:
 
 
 @dataclass(frozen=True)
+class MediaStreamProperties:
+    codec_name: str | None = None
+    codec_long_name: str | None = None
+    width: str | None = None
+    height: str | None = None
+    frame_rate: str | None = None
+    pixel_format: str | None = None
+    field_order: str | None = None
+    bit_rate: str | None = None
+    sample_rate: str | None = None
+    channels: str | None = None
+    channel_layout: str | None = None
+
+
+@dataclass(frozen=True)
 class SyncAnalysis:
     clip: P2ClipMetadata
     video_timecode: str | None
     video_duration_seconds: Fraction | None
     audio: tuple[AudioSync, ...]
     issues: tuple[str, ...]
+    video_properties: MediaStreamProperties | None = None
+    audio_properties: tuple[MediaStreamProperties | None, ...] = ()
 
     @property
     def eligible(self) -> bool:
@@ -123,7 +140,9 @@ def _probe(path: Path, executable: str) -> dict[str, object]:
         "-show_entries",
         (
             "format=start_time,duration:format_tags=timecode,material_package_umid:"
-            "stream=codec_type,codec_name,start_time,duration,sample_rate:"
+            "stream=codec_type,codec_name,codec_long_name,width,height,r_frame_rate,"
+            "avg_frame_rate,pix_fmt,field_order,bit_rate,sample_rate,channels,"
+            "channel_layout,start_time,duration:"
             "stream_tags=data_type"
         ),
         "-of",
@@ -188,6 +207,28 @@ def _essence_stream(
     )
 
 
+def _stream_properties(stream: dict[str, object]) -> MediaStreamProperties:
+    def value(key: str) -> str | None:
+        raw_value = stream.get(key)
+        if raw_value in (None, "", "N/A"):
+            return None
+        return str(raw_value)
+
+    return MediaStreamProperties(
+        codec_name=value("codec_name"),
+        codec_long_name=value("codec_long_name"),
+        width=value("width"),
+        height=value("height"),
+        frame_rate=value("avg_frame_rate") or value("r_frame_rate"),
+        pixel_format=value("pix_fmt"),
+        field_order=value("field_order"),
+        bit_rate=value("bit_rate"),
+        sample_rate=value("sample_rate"),
+        channels=value("channels"),
+        channel_layout=value("channel_layout"),
+    )
+
+
 def analyze_clip_sync(
     clip: P2ClipMetadata,
     ffprobe: str = "ffprobe",
@@ -211,6 +252,7 @@ def analyze_clip_sync(
         video_stream, video_tags, _ = _essence_stream(
             clip.video_file, "video", ffprobe
         )
+        video_properties = _stream_properties(video_stream)
         video_timecode = video_tags.get("timecode")
         video_time = (
             _timecode_seconds(str(video_timecode), clip.edit_unit)
@@ -242,6 +284,7 @@ def analyze_clip_sync(
                 issues.append("La duración del video no coincide con el XML P2 dentro de un cuadro.")
 
         audio_results: list[AudioSync] = []
+        audio_properties: list[MediaStreamProperties | None] = []
         if len(clip.audio_files) != clip.audio_track_count:
             issues.append(
                 f"El XML declara {clip.audio_track_count} pistas de audio, "
@@ -254,7 +297,9 @@ def analyze_clip_sync(
             except MediaProbeError as error:
                 issues.append(str(error))
                 audio_results.append(AudioSync(audio_path, None, None, None, None))
+                audio_properties.append(None)
                 continue
+            audio_properties.append(_stream_properties(stream))
 
             audio_timecode_value = tags.get("timecode")
             audio_timecode: str | None = (
@@ -328,6 +373,8 @@ def analyze_clip_sync(
             video_duration_seconds=video_duration,
             audio=tuple(audio_results),
             issues=tuple(dict.fromkeys(issues)),
+            video_properties=video_properties,
+            audio_properties=tuple(audio_properties),
         )
     except (MediaProbeError, ValueError, ZeroDivisionError) as error:
         return SyncAnalysis(

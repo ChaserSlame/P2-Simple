@@ -86,16 +86,23 @@ To launch the app again later, activate the virtual environment and run
 - Read P2 Clip XML identifiers, timecode, frame rate, and duration; associate
   video and audio MXF essence files using the clip XML and P2 directory layout.
 - Show a logical composition row for each video with its P2 audio tracks. This
-  measures their timecode/PTS offsets before rendering output.
+  appears as soon as P2 metadata is read, before the separate timecode/PTS
+  synchronization analysis finishes. Each row presents an asynchronously
+  generated thumbnail beside the filename, clip name, initial timecode,
+  duration, and frame rate.
 - Play an in-app audio/video preview for the selected clip, including seeking,
-  volume, and pause/stop controls. The app asynchronously creates a temporary
-  thumbnail and MOV proxy. The thumbnail is shown until playback starts. The
-  proxy copies the source video stream and mixes verified P2 audio tracks to AAC
-  using their measured offsets. If FFmpeg cannot mux the copied video into MOV,
-  it falls back to a scaled MPEG-4/AAC MP4 proxy. The original media is not
-  modified.
+  volume, and pause/stop controls. Video opens directly from the original MXF;
+  no video proxy or MP4 is generated. Verified external P2 audio is mixed
+  asynchronously to a temporary PCM WAV using its measured offsets and played
+  alongside the original video. Initial timecode and duration are highlighted
+  below the player, and clip properties and P2 metadata are grouped in separate
+  tabs. Playback shortcuts: Space toggles play/pause, M mutes/unmutes, and the
+  left/right arrows seek backward/forward by one second. A thumbnail is shown
+  while the audio mix is prepared. The original media is not modified.
 - Keep scanning off the UI thread, display progress and partial results, and
   report filesystem errors or an empty scan in the interface.
+- Export all scanned clips to CSV with the upload-folder-prefixed clip name,
+  initial timecode, and duration.
 
 P2 metadata is read from `CONTENTS/CLIP/<clip-id>.XML`; the corresponding video
 and audio essence files are resolved from `CONTENTS/VIDEO` and `CONTENTS/AUDIO`
@@ -125,18 +132,16 @@ python -m p2viewer
 ```
 
 The log reports directory scanning, P2 metadata scanning, each clip's
-synchronization analysis and individual `ffprobe` calls. Preview timings
-separate proxy generation, Qt player loading, and total time from selecting a
-clip until it becomes playable. Compare the same clips on the same storage
-before and after an optimization; preview generation copies the source video
-stream when MOV supports it and mixes audio into a temporary proxy. Unsupported
-combinations fall back to the scaled MPEG-4/AAC transcode.
+synchronization analysis and individual `ffprobe` calls. Preview timings report
+the audio-only PCM mix, original-MXF player loading, and total time from
+selection until playback controls are ready. Clip-list thumbnails are
+generated asynchronously after the rows appear. No video proxy is generated.
 
 P2 synchronization checks run concurrently for up to four clips at a time;
 the worker limit is bounded to avoid creating an unrestrained number of
 `ffprobe` processes.
-Generated preview proxies are cached for the current app session (up to four
-clips and 512 MiB total) and reused when selected again. The cache key includes
-source file size, modification time, and audio offsets, so changed media
-produces a fresh proxy. Poster thumbnails are also kept in a four-clip in-memory
-cache for quick display when revisiting a clip.
+Generated audio mixes are cached for the current app session (up to four clips
+and 512 MiB total) and reused when selected again. The cache key includes source
+file size, modification time, and audio offsets, so changed media produces a
+fresh mix. Poster thumbnails are also kept in a four-clip in-memory cache for
+quick display when revisiting a clip.

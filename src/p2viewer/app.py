@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSlider,
     QSplitter,
+    QStyle,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -227,10 +228,20 @@ class MainWindow(QMainWindow):
         self._preview_time_label = QLabel("—")
         self._preview_status = QLabel("Selecciona un clip para preparar la preview A/V.")
         self._preview_status.setWordWrap(True)
-        self._play_button = QPushButton("Reproducir")
+        self._play_button = QPushButton()
+        self._play_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
+        )
+        self._play_button.setToolTip("Reproducir")
+        self._play_button.setAccessibleName("Reproducir")
         self._play_button.setEnabled(False)
         self._play_button.clicked.connect(self._toggle_playback)
-        self._stop_button = QPushButton("Detener")
+        self._stop_button = QPushButton()
+        self._stop_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaStop)
+        )
+        self._stop_button.setToolTip("Detener")
+        self._stop_button.setAccessibleName("Detener")
         self._stop_button.setEnabled(False)
         self._stop_button.clicked.connect(self._player.stop)
         self._volume_slider = QSlider(Qt.Orientation.Horizontal)
@@ -391,7 +402,6 @@ class MainWindow(QMainWindow):
         self._preview_position.blockSignals(False)
         self._play_button.setEnabled(False)
         self._stop_button.setEnabled(False)
-        self._play_button.setText("Reproducir")
         self._preview_time_label.setText(
             f"00:00.000 / {self._format_seconds(duration_seconds)}"
         )
@@ -427,7 +437,6 @@ class MainWindow(QMainWindow):
         self._preview_position.setEnabled(False)
         self._preview_position.blockSignals(False)
         self._preview_time_label.setText("—")
-        self._play_button.setText("Reproducir")
         self._play_button.setEnabled(False)
         self._stop_button.setEnabled(False)
         self._preview_status.setText(status)
@@ -530,11 +539,16 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
-        self._play_button.setText(
-            "Pausar"
-            if state == QMediaPlayer.PlaybackState.PlayingState
-            else "Reproducir"
+        is_playing = state == QMediaPlayer.PlaybackState.PlayingState
+        label = "Pausar" if is_playing else "Reproducir"
+        icon = (
+            QStyle.StandardPixmap.SP_MediaPause
+            if is_playing
+            else QStyle.StandardPixmap.SP_MediaPlay
         )
+        self._play_button.setIcon(self.style().standardIcon(icon))
+        self._play_button.setToolTip(label)
+        self._play_button.setAccessibleName(label)
 
     @Slot(int)
     def _playback_position_changed(self, position: int) -> None:

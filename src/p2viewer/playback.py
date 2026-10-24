@@ -25,6 +25,45 @@ class _FFmpegEncodingError(PreviewRenderError):
     pass
 
 
+def render_preview_thumbnail(
+    video_path: Path,
+    output_path: Path,
+    ffmpeg: str = "ffmpeg",
+    cancel_event: threading.Event | None = None,
+) -> Path:
+    """Extract a lightweight poster frame for the selected video."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        ffmpeg,
+        "-nostdin",
+        "-hide_banner",
+        "-y",
+        "-loglevel",
+        "error",
+        "-ss",
+        "0.5",
+        "-i",
+        str(video_path),
+        "-map",
+        "0:v:0",
+        "-frames:v",
+        "1",
+        "-vf",
+        "scale=600:400:force_original_aspect_ratio=decrease,"
+        "pad=600:400:(ow-iw)/2:(oh-ih)/2:color=black",
+        "-q:v",
+        "4",
+        str(output_path),
+    ]
+    try:
+        _run_ffmpeg(command, video_path, cancel_event)
+        _validate_output(output_path, video_path)
+    except (PreviewRenderCancelled, PreviewRenderError) as error:
+        _remove_partial_output(output_path, error)
+        raise
+    return output_path
+
+
 def render_playback_proxy(
     video_path: Path,
     audio_tracks: tuple[AudioSync, ...],

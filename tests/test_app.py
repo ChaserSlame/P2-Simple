@@ -9,7 +9,63 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from p2viewer.app import MainWindow
+from p2viewer.p2_metadata import P2ClipMetadata
 from p2viewer.synchronization import AudioSync
+
+
+class ClipDurationDisplayTests(unittest.TestCase):
+    def test_duration_uses_p2_metadata_seconds(self) -> None:
+        metadata = P2ClipMetadata(
+            clip_xml=Path("clip.xml"),
+            clip_id="clip",
+            global_clip_id=None,
+            clip_name=None,
+            duration_frames=474,
+            duration_seconds=Fraction(474, 25),
+            edit_unit=None,
+            frame_rate="25",
+            start_timecode=None,
+            audio_track_count=0,
+            video_file=None,
+            audio_files=(),
+        )
+
+        self.assertEqual(
+            MainWindow._format_clip_table_duration(metadata),
+            "18.960 s",
+        )
+
+    def test_duration_falls_back_to_frames_or_dash(self) -> None:
+        base_metadata = {
+            "clip_xml": Path("clip.xml"),
+            "clip_id": "clip",
+            "global_clip_id": None,
+            "clip_name": None,
+            "duration_seconds": None,
+            "edit_unit": None,
+            "frame_rate": None,
+            "start_timecode": None,
+            "audio_track_count": 0,
+            "video_file": None,
+            "audio_files": (),
+        }
+        frame_duration = P2ClipMetadata(
+            **base_metadata,
+            duration_frames=474,
+        )
+        missing_duration = P2ClipMetadata(
+            **base_metadata,
+            duration_frames=None,
+        )
+
+        self.assertEqual(
+            MainWindow._format_clip_table_duration(frame_duration),
+            "474 cuadros",
+        )
+        self.assertEqual(
+            MainWindow._format_clip_table_duration(missing_duration),
+            "—",
+        )
 
 
 class PreviewCacheTests(unittest.TestCase):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import logging
 import sys
 import tempfile
@@ -9,13 +10,15 @@ import uuid
 from collections import OrderedDict
 from pathlib import Path
 
+import qdarktheme
 from PySide6.QtCore import QThread, QTimer, QUrl, Qt, Signal, Slot
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtGui import QCloseEvent, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -23,6 +26,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSlider,
     QSplitter,
+    QStackedWidget,
     QStyle,
     QTableWidget,
     QTableWidgetItem,
@@ -38,6 +42,7 @@ from p2viewer.playback import (
     PreviewRenderCancelled,
     PreviewRenderError,
     render_playback_proxy,
+    render_preview_thumbnail,
 )
 from p2viewer.synchronization import (
     AudioSync,
@@ -49,15 +54,18 @@ from p2viewer.synchronization import (
 logger = logging.getLogger(__name__)
 PREVIEW_CACHE_MAX_ENTRIES = 4
 PREVIEW_CACHE_MAX_BYTES = 512 * 1024 * 1024
+PREVIEW_THUMBNAIL_CACHE_MAX_ENTRIES = 4
 
 PreviewCacheKey = tuple[
     tuple[str, int, int],
     tuple[tuple[str, int, int, str], ...],
 ]
+PreviewThumbnailKey = tuple[str, int, int]
 
 
 class _PlaybackProxyThread(QThread):
     completed = Signal(str, str, str)
+    thumbnail_completed = Signal(str, str, str)
 
     def __init__(
         self,
@@ -65,6 +73,7 @@ class _PlaybackProxyThread(QThread):
         video_path: Path,
         audio_tracks: tuple[AudioSync, ...],
         output_path: Path,
+        thumbnail_path: Path,
         parent: QWidget,
     ) -> None:
         super().__init__(parent)
@@ -72,6 +81,7 @@ class _PlaybackProxyThread(QThread):
         self._video_path = video_path
         self._audio_tracks = audio_tracks
         self._output_path = output_path
+        self._thumbnail_path = thumbnail_path
         self._cancel_event = threading.Event()
 
     def cancel(self) -> None:
@@ -80,6 +90,23 @@ class _PlaybackProxyThread(QThread):
     def run(self) -> None:
         error_message = ""
         rendered_path = self._output_path
+        try:
+            thumbnail_path = render_preview_thumbnail(
+                self._video_path,
+                self._thumbnail_path,
+                cancel_event=self._cancel_event,
+            )
+            self.thumbnail_completed.emit(self._token, str(thumbnail_path), "")
+        except PreviewRenderCancelled:
+            pass
+        except (OSError, ValueError, PreviewRenderError) as error:
+            logger.warning(
+                "Preview thumbnail failed: video=%s reason=%s",
+                self._video_path.name,
+                error,
+            )
+            self.thumbnail_completed.emit(self._token, "", str(error))
+
         try:
             rendered_path = render_playback_proxy(
                 self._video_path,
@@ -180,7 +207,8 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("P2Viewer Plus - Python reconstruction")
-        self.resize(1600, 800)
+        self.resize(1600, 760)
+        self.setMinimumSize(1400, 760)
         self._thread: QThread | None = None
         self._media: list[MediaFile] = []
         self._p2_warnings: tuple[str, ...] = ()
@@ -197,39 +225,68 @@ class MainWindow(QMainWindow):
         self._preview_ready_logged_token: str | None = None
         self._preview_cache: OrderedDict[PreviewCacheKey, Path] = OrderedDict()
         self._preview_cache_keys_by_token: dict[str, PreviewCacheKey] = {}
+        self._preview_thumbnail_cache: OrderedDict[
+            PreviewThumbnailKey, QPixmap
+        ] = OrderedDict()
         self._preview_temp_dir = tempfile.TemporaryDirectory(prefix="p2viewer-preview-")
         self._closing_after_preview = False
 
         self._folder_label = QLabel("Ninguna carpeta seleccionada")
+        self._folder_label.setObjectName("folderPath")
+        self._folder_label.setMinimumHeight(48)
+        self._folder_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
         self._scan_button = QPushButton("Elegir carpeta...")
+        self._scan_button.setMinimumHeight(48)
+        self._scan_button.setObjectName("primaryButton")
+        self._scan_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon)
+        )
         self._scan_button.clicked.connect(self._choose_folder)
 
         self._clip_table = QTableWidget(0, 5)
+        self._clip_table.setObjectName("clipsTable")
         self._clip_table.setHorizontalHeaderLabels(
             [
-                "Video",
-                "Pistas de audio",
-                "Timecode inicial",
-                "Desfase máx.",
-                "Estado",
+                "#",
+                "VIDEO",
+                "AUDIO",
+                "TIMECODE",
+                "DURACIÓN",
             ]
         )
         self._clip_table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows
         )
         self._clip_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._clip_table.verticalHeader().hide()
         self._clip_table.itemSelectionChanged.connect(self._show_clip_selection)
         self._clip_table.horizontalHeader().setStretchLastSection(True)
-        self._clip_table.horizontalHeader().setMinimumSectionSize(90)
+        self._clip_table.horizontalHeader().setMinimumSectionSize(54)
 
         self._audio_output = QAudioOutput(self)
         self._audio_output.setVolume(0.7)
         self._player = QMediaPlayer(self)
         self._player.setAudioOutput(self._audio_output)
         self._preview_video = QVideoWidget()
+        self._preview_video.setObjectName("previewVideo")
         self._preview_video.setFixedSize(600, 400)
-        self._preview_video.setStyleSheet("QVideoWidget { background-color: #171717; }")
+        self._preview_video.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._preview_video.setStyleSheet(
+            "QVideoWidget#previewVideo { background-color: #050609; "
+            "border-radius: 10px; }"
+        )
         self._player.setVideoOutput(self._preview_video)
+        self._preview_stack = QStackedWidget()
+        self._preview_stack.setFixedSize(self._preview_video.size())
+        self._preview_placeholder = QLabel("Selecciona un clip para ver su miniatura")
+        self._preview_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._preview_placeholder.setObjectName("previewPlaceholder")
+        self._preview_placeholder.setFixedSize(self._preview_video.size())
+        self._preview_stack.addWidget(self._preview_placeholder)
+        self._preview_stack.addWidget(self._preview_video)
+        self._preview_stack.setCurrentWidget(self._preview_placeholder)
         self._player.positionChanged.connect(self._playback_position_changed)
         self._player.durationChanged.connect(self._playback_duration_changed)
         self._player.mediaStatusChanged.connect(self._playback_media_status_changed)
@@ -241,8 +298,11 @@ class MainWindow(QMainWindow):
         self._preview_position.setEnabled(False)
         self._preview_position.valueChanged.connect(self._seek_playback)
         self._preview_time_label = QLabel("—")
+        self._preview_time_label.setFixedWidth(170)
+        self._preview_time_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._preview_status = QLabel("Selecciona un clip para preparar la preview A/V.")
         self._preview_status.setWordWrap(True)
+        self._preview_status.setObjectName("previewStatus")
         self._play_button = QPushButton()
         self._play_button.setIcon(
             self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
@@ -262,76 +322,214 @@ class MainWindow(QMainWindow):
         self._volume_slider = QSlider(Qt.Orientation.Horizontal)
         self._volume_slider.setRange(0, 100)
         self._volume_slider.setValue(70)
-        self._volume_slider.setMaximumWidth(120)
+        self._volume_slider.setFixedWidth(100)
         self._volume_slider.valueChanged.connect(
             lambda volume: self._audio_output.setVolume(volume / 100)
         )
-        preview_controls = QHBoxLayout()
+        self._volume_button = QPushButton()
+        self._volume_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaVolume)
+        )
+        self._volume_button.setFixedSize(32, 32)
+        self._volume_button.setToolTip("Volumen")
+        self._volume_button.setAccessibleName("Volumen")
+        self._preview_controls_container = QWidget()
+        self._preview_controls_container.setFixedWidth(self._preview_video.width())
+        preview_controls = QHBoxLayout(self._preview_controls_container)
+        preview_controls.setContentsMargins(0, 0, 0, 0)
         preview_controls.addWidget(self._play_button)
         preview_controls.addWidget(self._stop_button)
         preview_controls.addWidget(self._preview_position, 1)
         preview_controls.addWidget(self._preview_time_label)
-        preview_controls.addWidget(QLabel("Volumen"))
+        preview_controls.addWidget(self._volume_button)
         preview_controls.addWidget(self._volume_slider)
 
-        preview_panel = QWidget()
+        preview_panel = QFrame()
+        preview_panel.setObjectName("panelCard")
         preview_layout = QVBoxLayout(preview_panel)
-        preview_layout.setContentsMargins(0, 0, 0, 0)
-        preview_layout.addWidget(QLabel("Video Preview"))
-        preview_layout.addWidget(self._preview_video, 1)
-        preview_layout.addLayout(preview_controls)
+        preview_layout.setContentsMargins(16, 16, 16, 16)
+        preview_layout.setSpacing(12)
+        preview_heading = QHBoxLayout()
+        preview_title = QLabel("Vista previa")
+        preview_title.setObjectName("panelTitle")
+        self._preview_file_label = QLabel("Sin clip")
+        self._preview_file_label.setObjectName("mutedLabel")
+        self._preview_file_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        preview_heading.addWidget(preview_title)
+        preview_heading.addWidget(self._preview_file_label, 1)
+        preview_layout.addLayout(preview_heading)
+        preview_layout.addWidget(
+            self._preview_stack, 0, Qt.AlignmentFlag.AlignHCenter
+        )
+        preview_layout.addWidget(
+            self._preview_controls_container, 0, Qt.AlignmentFlag.AlignHCenter
+        )
         preview_layout.addWidget(self._preview_status)
+        preview_layout.addStretch(1)
 
         self._preview_render_timer = QTimer(self)
         self._preview_render_timer.setSingleShot(True)
         self._preview_render_timer.timeout.connect(self._start_playback_render)
 
         self._details = QTextEdit()
+        self._details.setObjectName("clipDetails")
         self._details.setReadOnly(True)
         self._details.setPlaceholderText(
             "Selecciona un clip para ver su metadata P2 y sincronía."
         )
-
         controls = QHBoxLayout()
         controls.addWidget(self._scan_button)
         controls.addWidget(self._folder_label, 1)
 
-        clips_panel = QWidget()
+        clips_panel = QFrame()
+        clips_panel.setObjectName("panelCard")
         clips_layout = QVBoxLayout(clips_panel)
-        clips_layout.setContentsMargins(0, 0, 0, 0)
-        clips_layout.addWidget(QLabel("Clips"))
+        clips_layout.setContentsMargins(16, 16, 16, 16)
+        clips_layout.setSpacing(12)
+        clips_heading = QHBoxLayout()
+        clips_title = QLabel("Clips")
+        clips_title.setObjectName("panelTitle")
+        self._clip_count_label = QLabel("0 clips")
+        self._clip_count_label.setObjectName("countBadge")
+        self._clip_count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        clips_heading.addWidget(clips_title)
+        clips_heading.addStretch(1)
+        clips_heading.addWidget(self._clip_count_label)
+        clips_layout.addLayout(clips_heading)
         clips_layout.addWidget(self._clip_table, 1)
 
-        details_panel = QWidget()
+        details_panel = QFrame()
+        details_panel.setObjectName("panelCard")
         details_layout = QVBoxLayout(details_panel)
-        details_layout.setContentsMargins(0, 0, 0, 0)
-        details_layout.addWidget(QLabel("Información y sincronía"))
+        details_layout.setContentsMargins(16, 16, 16, 16)
+        details_layout.setSpacing(12)
+        details_title = QLabel("Información y sincronía")
+        details_title.setObjectName("panelTitle")
+        details_layout.addWidget(details_title)
         details_layout.addWidget(self._details, 1)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setObjectName("mainSplitter")
         splitter.setChildrenCollapsible(False)
         splitter.addWidget(clips_panel)
         splitter.addWidget(preview_panel)
         splitter.addWidget(details_panel)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 0)
-        splitter.setStretchFactor(2, 1)
-        splitter.setSizes([450, 640, 450])
+        splitter.setStretchFactor(0, 4)
+        splitter.setStretchFactor(1, 5)
+        splitter.setStretchFactor(2, 3)
+        splitter.setSizes([500, 680, 360])
 
+        status_footer = QWidget()
+        status_layout = QHBoxLayout(status_footer)
+        status_layout.setContentsMargins(4, 0, 4, 0)
+        status_dot = QLabel("●")
+        status_dot.setObjectName("statusDot")
         status_note = QLabel(
-            "La preview reproduce video y mezcla el audio P2 solo si su sincronía "
-            "fue verificada."
+            "La preview incluye audio P2 cuando la sincronía está verificada."
         )
-        status_note.setWordWrap(True)
+        status_note.setObjectName("mutedLabel")
+        status_layout.addWidget(status_dot)
+        status_layout.addWidget(status_note)
+        status_layout.addStretch(1)
 
         layout = QVBoxLayout()
+        layout.setContentsMargins(20, 12, 20, 12)
+        layout.setSpacing(14)
+        app_title = QLabel("P2Viewer Plus")
+        app_title.setObjectName("appTitle")
+        app_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(app_title)
         layout.addLayout(controls)
         layout.addWidget(splitter, 1)
-        layout.addWidget(status_note)
+        layout.addWidget(status_footer)
 
         central = QWidget()
         central.setLayout(layout)
         self.setCentralWidget(central)
+        self.setStyleSheet(
+            self.styleSheet()
+            + """
+            QFrame#panelCard {
+                background-color: #171a22;
+                border: 1px solid #282e3a;
+                border-radius: 16px;
+            }
+            QLabel#appTitle {
+                color: #dce2ed;
+                font-size: 16px;
+                font-weight: 600;
+                padding: 4px;
+            }
+            QLabel#panelTitle {
+                color: #e0e5ee;
+                font-size: 16px;
+                font-weight: 600;
+                background-color: transparent;
+            }
+            QLabel#mutedLabel {
+                color: #9aa5b7;
+                background-color: transparent;
+            }
+            QLabel#countBadge {
+                color: #b9c3d4;
+                background-color: #202530;
+                border-radius: 12px;
+                padding: 4px 12px;
+            }
+            QLabel#statusDot { color: #48d597; }
+            QLabel#previewStatus { color: #9aa5b7; }
+            QLabel#folderPath {
+                color: #aeb8c8;
+                background-color: #171a22;
+                border: 1px solid #282e3a;
+                border-radius: 12px;
+                padding: 0 16px;
+            }
+            QPushButton#primaryButton {
+                color: #111827;
+                background-color: #79a9ff;
+                border: none;
+                border-radius: 12px;
+                padding: 0 18px;
+                font-weight: 600;
+            }
+            QPushButton#primaryButton:hover { background-color: #91b8ff; }
+            QTableWidget#clipsTable {
+                background-color: transparent;
+                alternate-background-color: #1b1f29;
+                border: none;
+                gridline-color: transparent;
+                selection-background-color: #29395e;
+                selection-color: #f0f4fc;
+            }
+            QTableWidget#clipsTable::item {
+                border: none;
+                padding: 9px 6px;
+            }
+            QHeaderView::section {
+                color: #9aa5b7;
+                background-color: #171a22;
+                border: none;
+                padding: 6px;
+                font-size: 11px;
+                font-weight: 600;
+            }
+            QTextEdit#clipDetails {
+                color: #dce2ed;
+                font-size: 11px;
+                background-color: transparent;
+                border: none;
+                selection-background-color: #344b77;
+            }
+            QLabel#previewPlaceholder {
+                color: #9aa5b7;
+                background-color: #050609;
+                border-radius: 10px;
+            }
+            QVideoWidget#previewVideo { background-color: #050609; }
+            QSplitter::handle { background-color: transparent; width: 12px; }
+            """
+        )
         self.statusBar().showMessage("Listo")
 
     @Slot()
@@ -419,6 +617,7 @@ class MainWindow(QMainWindow):
         self._preview_ready_logged_token = None
         self._player.stop()
         self._player.setSource(QUrl())
+        self._show_preview_thumbnail(video_path)
         self._remove_active_preview_file()
         self._preview_position.blockSignals(True)
         self._preview_position.setValue(0)
@@ -450,6 +649,10 @@ class MainWindow(QMainWindow):
 
     def _clear_playback_preview(self, status: str) -> None:
         self._wanted_playback = None
+        self._preview_file_label.setText("Sin clip")
+        self._preview_placeholder.setPixmap(QPixmap())
+        self._preview_placeholder.setText("Selecciona un clip para ver su miniatura")
+        self._preview_stack.setCurrentWidget(self._preview_placeholder)
         self._preview_requested_at = None
         self._preview_render_finished_at = None
         self._active_preview_token = None
@@ -511,20 +714,115 @@ class MainWindow(QMainWindow):
             self._preview_cache.pop(cache_key)
 
         output_path = Path(self._preview_temp_dir.name) / f"{token}.mp4"
+        thumbnail_path = Path(self._preview_temp_dir.name) / f"{token}.jpg"
         self._preview_cache_keys_by_token[token] = cache_key
         thread = _PlaybackProxyThread(
             token,
             video_path,
             audio_tracks,
             output_path,
+            thumbnail_path,
             self,
         )
         thread.completed.connect(self._capture_playback_render_result)
+        thread.thumbnail_completed.connect(self._preview_thumbnail_rendered)
         thread.finished.connect(self._playback_render_finished)
         thread.finished.connect(thread.deleteLater)
         self._preview_render_result = None
         self._preview_render_thread = thread
         thread.start()
+
+    @staticmethod
+    def _preview_thumbnail_key(video_path: Path) -> PreviewThumbnailKey:
+        video_stat = video_path.stat()
+        return (
+            str(video_path.resolve()),
+            video_stat.st_size,
+            video_stat.st_mtime_ns,
+        )
+
+    def _show_preview_thumbnail(self, video_path: Path) -> None:
+        self._preview_placeholder.setPixmap(QPixmap())
+        self._preview_placeholder.setText("Generando miniatura…")
+        self._preview_stack.setCurrentWidget(self._preview_placeholder)
+        try:
+            key = self._preview_thumbnail_key(video_path)
+        except OSError as error:
+            self._preview_placeholder.setText("Miniatura no disponible")
+            logger.warning(
+                "Preview thumbnail cache lookup failed: video=%s reason=%s",
+                video_path.name,
+                error,
+            )
+            return
+        cached_thumbnail = self._preview_thumbnail_cache.get(key)
+        if cached_thumbnail is not None:
+            self._preview_thumbnail_cache.move_to_end(key)
+            self._set_preview_thumbnail(cached_thumbnail)
+
+    def _set_preview_thumbnail(self, thumbnail: QPixmap) -> None:
+        scaled_thumbnail = thumbnail.scaled(
+            self._preview_placeholder.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self._preview_placeholder.setPixmap(scaled_thumbnail)
+        self._preview_placeholder.setText("")
+        self._preview_stack.setCurrentWidget(self._preview_placeholder)
+
+    @Slot(str, str, str)
+    def _preview_thumbnail_rendered(
+        self,
+        token: str,
+        thumbnail_name: str,
+        error: str,
+    ) -> None:
+        thumbnail_path = Path(thumbnail_name) if thumbnail_name else None
+        wanted_token = (
+            self._wanted_playback[0]
+            if self._wanted_playback is not None
+            else None
+        )
+        if token != wanted_token:
+            if thumbnail_path is not None:
+                self._delete_preview_file(thumbnail_path)
+            return
+        if error:
+            self._preview_placeholder.setText("Miniatura no disponible")
+            logger.warning(
+                "Preview thumbnail unavailable: video=%s reason=%s",
+                self._wanted_playback[1].name if self._wanted_playback else "unknown",
+                error,
+            )
+            return
+        if thumbnail_path is None:
+            return
+        thumbnail = QPixmap(str(thumbnail_path))
+        self._delete_preview_file(thumbnail_path)
+        if thumbnail.isNull():
+            self._preview_placeholder.setText("Miniatura no disponible")
+            logger.warning(
+                "Preview thumbnail could not be loaded: video=%s",
+                self._wanted_playback[1].name if self._wanted_playback else "unknown",
+            )
+            return
+        if self._wanted_playback is not None:
+            try:
+                key = self._preview_thumbnail_key(self._wanted_playback[1])
+            except OSError as error:
+                logger.warning(
+                    "Preview thumbnail could not be cached: reason=%s",
+                    error,
+                )
+            else:
+                self._preview_thumbnail_cache[key] = thumbnail
+                self._preview_thumbnail_cache.move_to_end(key)
+                while (
+                    len(self._preview_thumbnail_cache)
+                    > PREVIEW_THUMBNAIL_CACHE_MAX_ENTRIES
+                ):
+                    self._preview_thumbnail_cache.popitem(last=False)
+        self._set_preview_thumbnail(thumbnail)
 
     @staticmethod
     def _preview_cache_key(
@@ -666,6 +964,8 @@ class MainWindow(QMainWindow):
     @Slot()
     def _playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
         is_playing = state == QMediaPlayer.PlaybackState.PlayingState
+        if is_playing:
+            self._preview_stack.setCurrentWidget(self._preview_video)
         label = "Pausar" if is_playing else "Reproducir"
         icon = (
             QStyle.StandardPixmap.SP_MediaPause
@@ -806,36 +1106,21 @@ class MainWindow(QMainWindow):
     def _populate_clip_table(self) -> None:
         self._clip_assemblies = build_clip_assemblies(self._media, self._p2_result)
         self._clip_table.setRowCount(len(self._clip_assemblies))
+        self._clip_count_label.setText(
+            f"{len(self._clip_assemblies)} clips"
+        )
         for row, assembly in enumerate(self._clip_assemblies):
             metadata = assembly.metadata
-            sync = self._sync_by_video.get(assembly.video.path)
-            if metadata is None:
-                timecode = "—"
-                offset = "—"
-                status = "Sin asociación P2"
-            else:
-                timecode = metadata.start_timecode or "No disponible"
-                if sync is not None and sync.max_abs_offset_seconds is not None:
-                    offset = f"{float(sync.max_abs_offset_seconds):.6f} s"
-                else:
-                    offset = "No medido"
-                if sync is not None and sync.eligible:
-                    status = "Sincronía verificada"
-                elif sync is not None and sync.issues:
-                    status = f"Sin verificar: {sync.issues[0]}"
-                elif metadata.audio_track_count > len(assembly.audio_files):
-                    status = "Faltan esencias de audio"
-                elif not assembly.audio_files:
-                    status = "No hay pistas de audio P2"
-                else:
-                    status = "Sin análisis de sincronía"
-
             values = (
+                str(row + 1),
                 assembly.video.path.name,
-                f"{len(assembly.audio_files)} pista(s)",
-                timecode,
-                offset,
-                status,
+                f"{len(assembly.audio_files)}",
+                metadata.start_timecode if metadata is not None else "—",
+                (
+                    self._format_clip_table_duration(metadata)
+                    if metadata is not None
+                    else "—"
+                ),
             )
             for column, value in enumerate(values):
                 self._clip_table.setItem(row, column, QTableWidgetItem(value))
@@ -852,6 +1137,7 @@ class MainWindow(QMainWindow):
             return
 
         assembly = self._clip_assemblies[row]
+        self._preview_file_label.setText(assembly.video.path.name)
         metadata = assembly.metadata
         duration = (
             float(metadata.duration_seconds)
@@ -877,42 +1163,55 @@ class MainWindow(QMainWindow):
             duration,
         )
         details = [
-            "Información y sincronía del clip.",
-            f"Video: {assembly.video.path}",
+            '<h3 style="color:#9aa5b7;font-size:11px">CLIP</h3>',
+            f'<p><span style="color:#9aa5b7">VIDEO</span><br>'
+            f"<b>{html.escape(assembly.video.path.name)}</b></p>",
+            f'<p><span style="color:#9aa5b7">RUTA</span><br>'
+            f"{html.escape(str(assembly.video.path))}</p>",
         ]
         if metadata is None:
             details.extend(
                 (
-                    "",
-                    "No se encontró metadata P2 que asocie este video "
-                    "con pistas de audio.",
+                    '<h3 style="color:#9aa5b7;font-size:11px">INFORMACIÓN P2</h3>',
+                    "<p>No se encontró metadata P2 ni pistas asociadas.</p>",
                 )
             )
         else:
             details.extend(
                 (
-                    "",
-                    f"ID del clip: {metadata.clip_id}",
-                    f"GlobalClipID: {metadata.global_clip_id or 'no disponible'}",
-                    f"Nombre: {metadata.clip_name or 'no disponible'}",
-                    f"Timecode inicial: {metadata.start_timecode or 'no disponible'}",
-                    f"Frecuencia de cuadro: {metadata.frame_rate or 'no disponible'}",
-                    f"Duración: {self._format_p2_duration(metadata)}",
-                    f"XML P2: {metadata.clip_xml}",
-                    f"Pistas de audio declaradas: {metadata.audio_track_count}",
-                    "Esencias de audio encontradas:",
+                    '<h3 style="color:#9aa5b7;font-size:11px">'
+                    "INFORMACIÓN P2</h3>",
+                    f'<p><span style="color:#9aa5b7">ID DEL CLIP</span><br>'
+                    f"<b>{html.escape(metadata.clip_id)}</b></p>",
+                    f'<p><span style="color:#9aa5b7">NOMBRE</span><br>'
+                    f"{html.escape(metadata.clip_name or '—')}</p>",
+                    f'<p><span style="color:#9aa5b7">TIMECODE INICIAL</span><br>'
+                    f"{html.escape(metadata.start_timecode or '—')}</p>",
+                    f'<p><span style="color:#9aa5b7">FRECUENCIA DE CUADRO</span><br>'
+                    f"{html.escape(metadata.frame_rate or '—')}</p>",
+                    f'<p><span style="color:#9aa5b7">DURACIÓN</span><br>'
+                    f"{html.escape(self._format_p2_duration(metadata))}</p>",
+                    f'<p><span style="color:#9aa5b7">GLOBALCLIPID</span><br>'
+                    f"{html.escape(metadata.global_clip_id or '—')}</p>",
+                    f'<p><span style="color:#9aa5b7">ARCHIVO XML P2</span><br>'
+                    f"{html.escape(str(metadata.clip_xml))}</p>",
+                    f'<h3 style="color:#9aa5b7;font-size:11px">'
+                    f"AUDIO · {metadata.audio_track_count} PISTAS</h3>",
                 )
             )
             if assembly.audio_files:
-                details.extend(f"- {path}" for path in assembly.audio_files)
+                details.extend(
+                    f"<p>{html.escape(path.name)}</p>"
+                    for path in assembly.audio_files
+                )
             else:
-                details.append("- Ninguna")
+                details.append("<p>Sin pistas asociadas</p>")
 
         if sync is not None:
             details.extend(
                 (
-                    "",
-                    "Medición de sincronía con ffprobe:",
+                    '<h3 style="color:#9aa5b7;font-size:11px">SINCRONÍA</h3>',
+                    "<p>Medición con ffprobe</p>",
                 )
             )
             for track in sync.audio:
@@ -921,22 +1220,48 @@ class MainWindow(QMainWindow):
                 else:
                     offset_text = f"{float(track.offset_seconds):+.6f} s"
                 details.append(
-                    f"- {track.path.name}: desfase {offset_text}; "
-                    f"timecode {track.timecode or 'no disponible'}"
+                    f"<p><b>{html.escape(track.path.name)}</b><br>"
+                    f"Desfase {html.escape(offset_text)}<br>"
+                    f"TC {html.escape(track.timecode or '—')}</p>"
                 )
             details.append(
-                "Estado: sincronía verificada."
+                "<p><b>Sincronía verificada</b></p>"
                 if sync.eligible
-                else "Estado: sincronía no verificada."
+                else "<p><b>Sincronía no verificada</b></p>"
             )
-            details.extend(f"- {issue}" for issue in sync.issues)
+            if sync.max_abs_offset_seconds is not None:
+                details.append(
+                    '<p><span style="color:#9aa5b7">DESFASE MÁXIMO</span><br>'
+                    f"{float(sync.max_abs_offset_seconds):.6f} s</p>"
+                )
+            details.extend(
+                f"<p>{html.escape(issue)}</p>" for issue in sync.issues
+            )
         else:
-            details.extend(("", "La sincronía todavía no fue medida."))
+            details.extend(
+                (
+                    '<h3 style="color:#9aa5b7;font-size:11px">SINCRONÍA</h3>',
+                    "<p>Pendiente de medición.</p>",
+                )
+            )
 
         if self._p2_warnings:
-            details.extend(("", "Advertencias de lectura P2:"))
-            details.extend(f"- {warning}" for warning in self._p2_warnings[:10])
-        self._details.setPlainText("\n".join(details))
+            details.append(
+                '<h3 style="color:#9aa5b7;font-size:11px">AVISOS</h3>'
+            )
+            details.extend(
+                f"<p>{html.escape(warning)}</p>"
+                for warning in self._p2_warnings[:10]
+            )
+        self._details.setHtml("".join(details))
+
+    @staticmethod
+    def _format_clip_table_duration(metadata: P2ClipMetadata) -> str:
+        if metadata.duration_seconds is not None:
+            return f"{float(metadata.duration_seconds):.3f} s"
+        if metadata.duration_frames is not None:
+            return f"{metadata.duration_frames} cuadros"
+        return "—"
 
     @staticmethod
     def _format_p2_duration(metadata: P2ClipMetadata) -> str:
@@ -990,6 +1315,8 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     app = QApplication(sys.argv)
+    app.setStyleSheet(qdarktheme.load_stylesheet("dark"))
+    app.setPalette(qdarktheme.load_palette("dark"))
     window = MainWindow()
     window.show()
     return app.exec()

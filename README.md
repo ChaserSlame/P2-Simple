@@ -11,7 +11,8 @@ and browsing supported media files.
 - Python 3.10 or newer.
 - FFmpeg, with both `ffmpeg` and `ffprobe` available on `PATH`. These tools
   are required for audio/video previews and synchronization checks.
-- PySide6 6.8 or newer. It is installed automatically with the project below.
+- PySide6 6.8 or newer and PyQtDarkTheme 0.1.7. They are installed
+  automatically with the project below.
 
 Check that Python and FFmpeg are available before installing:
 
@@ -88,10 +89,11 @@ To launch the app again later, activate the virtual environment and run
   measures their timecode/PTS offsets before rendering output.
 - Play an in-app audio/video preview for the selected clip, including seeking,
   volume, and pause/stop controls. The app asynchronously creates a temporary
-  MOV proxy by copying the source video stream and mixing verified P2 audio
-  tracks to AAC using their measured offsets. If FFmpeg cannot mux the copied
-  video into MOV, it falls back to a scaled MPEG-4/AAC MP4 proxy. The original
-  media is not modified.
+  thumbnail and MOV proxy. The thumbnail is shown until playback starts. The
+  proxy copies the source video stream and mixes verified P2 audio tracks to AAC
+  using their measured offsets. If FFmpeg cannot mux the copied video into MOV,
+  it falls back to a scaled MPEG-4/AAC MP4 proxy. The original media is not
+  modified.
 - Keep scanning off the UI thread, display progress and partial results, and
   report filesystem errors or an empty scan in the interface.
 
@@ -136,4 +138,5 @@ the worker limit is bounded to avoid creating an unrestrained number of
 Generated preview proxies are cached for the current app session (up to four
 clips and 512 MiB total) and reused when selected again. The cache key includes
 source file size, modification time, and audio offsets, so changed media
-produces a fresh proxy.
+produces a fresh proxy. Poster thumbnails are also kept in a four-clip in-memory
+cache for quick display when revisiting a clip.

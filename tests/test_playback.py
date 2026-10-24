@@ -6,7 +6,11 @@ from fractions import Fraction
 from pathlib import Path
 from unittest.mock import patch
 
-from p2viewer.playback import PreviewRenderError, render_playback_proxy
+from p2viewer.playback import (
+    PreviewRenderError,
+    render_playback_proxy,
+    render_preview_thumbnail,
+)
 from p2viewer.synchronization import AudioSync
 
 
@@ -39,6 +43,32 @@ class _FailedProcess(_SuccessfulProcess):
 
 
 class PlaybackProxyTests(unittest.TestCase):
+    def test_thumbnail_extracts_one_scaled_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            output = root / "thumbnail.jpg"
+
+            def write_thumbnail(
+                command: list[str],
+                video_path: Path,
+                cancel_event: object,
+            ) -> None:
+                del video_path, cancel_event
+                Path(command[-1]).write_bytes(b"thumbnail")
+
+            with patch(
+                "p2viewer.playback._run_ffmpeg",
+                side_effect=write_thumbnail,
+            ) as run_ffmpeg:
+                result = render_preview_thumbnail(root / "video.mxf", output)
+
+            self.assertEqual(result, output)
+            self.assertEqual(output.read_bytes(), b"thumbnail")
+            command = run_ffmpeg.call_args.args[0]
+            self.assertIn("0:v:0", command)
+            self.assertIn("1", command)
+            self.assertTrue(any(argument.startswith("scale=600:400") for argument in command))
+
     def test_proxy_mixes_verified_audio_and_applies_offsets(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

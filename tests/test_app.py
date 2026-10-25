@@ -222,7 +222,6 @@ class PreviewCacheTests(unittest.TestCase):
                 MainWindow._start_playback_render(fake_window)
 
         activate_preview.assert_called_once_with(
-            "token",
             cached_preview,
             cache_hit=True,
         )

@@ -20,6 +20,7 @@ from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractSpinBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QHeaderView,
@@ -30,6 +31,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
     QSlider,
     QSplitter,
     QStackedWidget,
@@ -442,7 +444,10 @@ class MainWindow(QMainWindow):
         self._has_external_audio = False
         self._preview_video = QVideoWidget()
         self._preview_video.setObjectName("previewVideo")
-        self._preview_video.setFixedSize(600, 338)
+        self._preview_video.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
         self._preview_video.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._preview_video.setStyleSheet(
             "QVideoWidget#previewVideo { background-color: #050609; "
@@ -450,11 +455,11 @@ class MainWindow(QMainWindow):
         )
         self._player.setVideoOutput(self._preview_video)
         self._preview_stack = QStackedWidget()
-        self._preview_stack.setFixedSize(self._preview_video.size())
+        self._preview_stack.setFixedSize(600, 338)
         self._preview_placeholder = QLabel("Selecciona un clip para ver su miniatura")
         self._preview_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._preview_placeholder.setObjectName("previewPlaceholder")
-        self._preview_placeholder.setFixedSize(self._preview_video.size())
+        self._preview_placeholder.setFixedSize(600, 338)
         self._preview_stack.addWidget(self._preview_placeholder)
         self._preview_stack.addWidget(self._preview_video)
         self._preview_stack.setCurrentWidget(self._preview_placeholder)
@@ -505,7 +510,7 @@ class MainWindow(QMainWindow):
         timing_divider.setObjectName("clipTimingDivider")
         timing_layout.addWidget(timing_divider)
         timing_layout.addLayout(duration_group, 1)
-        timing_panel.setFixedWidth(self._preview_video.width())
+        timing_panel.setFixedWidth(self._preview_stack.width())
 
         self._preview_status = QLabel("Selecciona un clip para preparar la preview A/V.")
         self._preview_status.setWordWrap(True)
@@ -539,8 +544,13 @@ class MainWindow(QMainWindow):
         self._volume_button.setToolTip("Volumen")
         self._volume_button.setAccessibleName("Volumen")
         self._volume_button.clicked.connect(self._toggle_playback_mute)
+        self._fullscreen_button = QPushButton()
+        self._fullscreen_button.setFixedSize(32, 32)
+        self._fullscreen_button.setEnabled(False)
+        self._fullscreen_button.clicked.connect(self._toggle_preview_fullscreen)
+        self._set_fullscreen_button_state(False)
         self._preview_controls_container = QWidget()
-        self._preview_controls_container.setFixedWidth(self._preview_video.width())
+        self._preview_controls_container.setFixedWidth(self._preview_stack.width())
         self._preview_controls_container.setFixedHeight(40)
         preview_controls = QHBoxLayout(self._preview_controls_container)
         preview_controls.setContentsMargins(0, 0, 0, 0)
@@ -550,10 +560,46 @@ class MainWindow(QMainWindow):
         preview_controls.addWidget(self._preview_time_label)
         preview_controls.addWidget(self._volume_button)
         preview_controls.addWidget(self._volume_slider)
+        preview_controls.addWidget(self._fullscreen_button)
+
+        self._preview_fullscreen_dialog = QDialog(self)
+        self._preview_fullscreen_dialog.setWindowTitle("Vista previa")
+        self._preview_fullscreen_dialog.setStyleSheet(
+            "QDialog { background-color: #050609; }"
+        )
+        self._preview_fullscreen_layout = QVBoxLayout(
+            self._preview_fullscreen_dialog
+        )
+        self._preview_fullscreen_layout.setContentsMargins(12, 12, 12, 12)
+        self._preview_fullscreen_layout.setSpacing(8)
+        self._preview_fullscreen_video = QVideoWidget(
+            self._preview_fullscreen_dialog
+        )
+        self._preview_fullscreen_video.setObjectName("previewFullscreenVideo")
+        self._preview_fullscreen_video.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        self._preview_fullscreen_video.setAttribute(
+            Qt.WidgetAttribute.WA_StyledBackground,
+            True,
+        )
+        self._preview_fullscreen_video.setStyleSheet(
+            "QVideoWidget#previewFullscreenVideo { background-color: #050609; }"
+        )
+        self._preview_fullscreen_layout.addWidget(
+            self._preview_fullscreen_video,
+            1,
+        )
+        self._preview_fullscreen_dialog.finished.connect(
+            self._exit_preview_fullscreen
+        )
+        self._preview_is_fullscreen = False
 
         preview_panel = QFrame()
         preview_panel.setObjectName("panelCard")
         preview_layout = QVBoxLayout(preview_panel)
+        self._preview_layout = preview_layout
         preview_layout.setContentsMargins(16, 16, 16, 16)
         preview_layout.setSpacing(12)
         preview_heading = QHBoxLayout()
@@ -570,6 +616,9 @@ class MainWindow(QMainWindow):
         )
         preview_layout.addWidget(
             self._preview_controls_container, 0, Qt.AlignmentFlag.AlignHCenter
+        )
+        self._preview_controls_layout_index = preview_layout.indexOf(
+            self._preview_controls_container
         )
         preview_layout.addWidget(timing_panel, 0, Qt.AlignmentFlag.AlignHCenter)
         preview_layout.addWidget(self._preview_status)
@@ -913,6 +962,7 @@ class MainWindow(QMainWindow):
         declared_audio_count: int,
         duration_seconds: float | None,
     ) -> None:
+        self._exit_preview_fullscreen()
         if self._preview_render_thread is not None:
             self._preview_render_thread.cancel()
 
@@ -936,6 +986,7 @@ class MainWindow(QMainWindow):
         self._preview_position.blockSignals(False)
         self._play_button.setEnabled(False)
         self._stop_button.setEnabled(False)
+        self._fullscreen_button.setEnabled(False)
         self._preview_time_label.setText(
             f"00:00.000 / {self._format_seconds(duration_seconds)}"
         )
@@ -964,6 +1015,7 @@ class MainWindow(QMainWindow):
         self._preview_render_timer.start(0)
 
     def _clear_playback_preview(self, status: str) -> None:
+        self._exit_preview_fullscreen()
         self._wanted_playback = None
         self._preview_file_label.setText("Sin clip")
         self._preview_placeholder.setPixmap(QPixmap())
@@ -993,6 +1045,7 @@ class MainWindow(QMainWindow):
         self._preview_time_label.setText("—")
         self._play_button.setEnabled(False)
         self._stop_button.setEnabled(False)
+        self._fullscreen_button.setEnabled(False)
         self._preview_status.setText(status)
 
     def _remove_active_preview_file(self) -> None:
@@ -1038,7 +1091,6 @@ class MainWindow(QMainWindow):
                     self._preview_cache.move_to_end(cache_key)
                     logger.info("Preview audio cache hit: video=%s", video_path.name)
                     self._activate_playback_preview(
-                        token,
                         cached_path,
                         cache_hit=True,
                     )
@@ -1256,11 +1308,10 @@ class MainWindow(QMainWindow):
         cache_key = self._preview_cache_keys_by_token.pop(token, None)
         if cache_key is not None:
             self._cache_preview(cache_key, audio_path)
-        self._activate_playback_preview(token, audio_path, cache_hit=False)
+        self._activate_playback_preview(audio_path, cache_hit=False)
 
     def _activate_playback_preview(
         self,
-        token: str,
         output_path: Path,
         *,
         cache_hit: bool,
@@ -1298,10 +1349,22 @@ class MainWindow(QMainWindow):
             ("M", self._shortcut_toggle_mute),
             ("Left", self._shortcut_rewind),
             ("Right", self._shortcut_forward),
+            ("F", self._shortcut_toggle_fullscreen),
         )
         self._playback_shortcuts: list[QShortcut] = []
         for sequence, callback in shortcuts:
             shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+            shortcut.activated.connect(callback)
+            self._playback_shortcuts.append(shortcut)
+        for sequence, callback in (
+            ("F", self._shortcut_toggle_fullscreen),
+            ("Escape", self._shortcut_exit_fullscreen),
+        ):
+            shortcut = QShortcut(
+                QKeySequence(sequence),
+                self._preview_fullscreen_dialog,
+            )
             shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
             shortcut.activated.connect(callback)
             self._playback_shortcuts.append(shortcut)
@@ -1342,6 +1405,77 @@ class MainWindow(QMainWindow):
     def _shortcut_forward(self) -> None:
         if not self._shortcut_is_blocked_by_text_input():
             self._seek_playback_by(1000)
+
+    @Slot()
+    def _shortcut_toggle_fullscreen(self) -> None:
+        if self._preview_is_fullscreen or (
+            not self._shortcut_is_blocked_by_text_input()
+            and self._fullscreen_button.isEnabled()
+        ):
+            self._toggle_preview_fullscreen()
+
+    @Slot()
+    def _shortcut_exit_fullscreen(self) -> None:
+        self._exit_preview_fullscreen()
+
+    @Slot()
+    def _toggle_preview_fullscreen(self) -> None:
+        if self._preview_is_fullscreen:
+            self._exit_preview_fullscreen()
+            return
+        if not self._fullscreen_button.isEnabled():
+            return
+
+        self._preview_is_fullscreen = True
+        self._preview_stack.setCurrentWidget(self._preview_video)
+        self._player.setVideoOutput(self._preview_fullscreen_video)
+        self._preview_fullscreen_layout.addWidget(
+            self._preview_controls_container
+        )
+        self._preview_controls_container.setMinimumWidth(
+            self._preview_stack.width()
+        )
+        self._preview_controls_container.setMaximumWidth(16_777_215)
+        self._preview_controls_container.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        self._set_fullscreen_button_state(True)
+        self._preview_fullscreen_dialog.showFullScreen()
+
+    @Slot()
+    def _exit_preview_fullscreen(self) -> None:
+        if not self._preview_is_fullscreen:
+            return
+        self._preview_is_fullscreen = False
+        self._preview_fullscreen_dialog.hide()
+        self._player.setVideoOutput(self._preview_video)
+        self._preview_stack.setCurrentWidget(self._preview_video)
+        self._preview_layout.insertWidget(
+            self._preview_controls_layout_index,
+            self._preview_controls_container,
+            0,
+            Qt.AlignmentFlag.AlignHCenter,
+        )
+        self._preview_controls_container.setFixedWidth(
+            self._preview_stack.width()
+        )
+        self._set_fullscreen_button_state(False)
+
+    def _set_fullscreen_button_state(self, fullscreen: bool) -> None:
+        icon = (
+            QStyle.StandardPixmap.SP_TitleBarNormalButton
+            if fullscreen
+            else QStyle.StandardPixmap.SP_TitleBarMaxButton
+        )
+        label = (
+            "Salir de pantalla completa (F)"
+            if fullscreen
+            else "Pantalla completa (F)"
+        )
+        self._fullscreen_button.setIcon(self.style().standardIcon(icon))
+        self._fullscreen_button.setToolTip(label)
+        self._fullscreen_button.setAccessibleName(label)
 
     @Slot()
     def _toggle_playback(self) -> None:
@@ -1402,6 +1536,7 @@ class MainWindow(QMainWindow):
         ready = video_ready and audio_ready
         self._play_button.setEnabled(ready)
         self._stop_button.setEnabled(ready)
+        self._fullscreen_button.setEnabled(ready or self._preview_is_fullscreen)
         if ready and token != self._preview_ready_logged_token:
             self._preview_ready_logged_token = token
             now = time.perf_counter()
@@ -1550,6 +1685,7 @@ class MainWindow(QMainWindow):
             return
         self._play_button.setEnabled(False)
         self._stop_button.setEnabled(False)
+        self._fullscreen_button.setEnabled(self._preview_is_fullscreen)
         self._preview_status.setText(
             f"No se pudo reproducir la preview: {message or self._player.errorString()}"
         )
@@ -2242,6 +2378,7 @@ class MainWindow(QMainWindow):
         return MainWindow._format_seconds(milliseconds / 1000)
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._exit_preview_fullscreen()
         if (
             self._clip_thumbnail_thread is not None
             and self._clip_thumbnail_thread.isRunning()

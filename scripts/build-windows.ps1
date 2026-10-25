@@ -107,7 +107,7 @@ $ffmpegLicenseExitCode = $LASTEXITCODE
 if (
     $ffmpegVersionExitCode -ne 0 -or
     $ffmpegLicenseExitCode -ne 0 -or
-    $ffmpegLicense -notmatch "LGPL version"
+    $ffmpegLicense -notmatch "(?i)(LGPL|Lesser General Public License)"
 ) {
     throw "ffmpeg.exe no se ejecutó o no reporta una licencia LGPL."
 }
@@ -118,7 +118,7 @@ $ffprobeLicenseExitCode = $LASTEXITCODE
 if (
     $ffprobeVersionExitCode -ne 0 -or
     $ffprobeLicenseExitCode -ne 0 -or
-    $ffprobeLicense -notmatch "LGPL version"
+    $ffprobeLicense -notmatch "(?i)(LGPL|Lesser General Public License)"
 ) {
     throw "ffprobe.exe no se ejecutó o no reporta una licencia LGPL."
 }

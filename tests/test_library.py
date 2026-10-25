@@ -12,7 +12,7 @@ from p2viewer.p2_metadata import scan_p2_metadata
 class ScanMediaTests(unittest.TestCase):
     def test_finds_supported_files_and_classifies_p2_layout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory)
+            root = Path(temporary_directory).resolve()
             p2_clip = root / "CONTENTS" / "CLIP" / "A001" / "clip.MXF"
             av_clip = root / "CONTENTS" / "AVCLIP" / "B001" / "video.MTS"
             ignored = root / "CONTENTS" / "CLIP" / "metadata.XML"
@@ -33,7 +33,7 @@ class ScanMediaTests(unittest.TestCase):
 
     def test_rejects_a_file_as_the_scan_root(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            file_path = Path(temporary_directory) / "not-a-folder"
+            file_path = Path(temporary_directory).resolve() / "not-a-folder"
             file_path.write_text("x", encoding="utf-8")
 
             with self.assertRaises(NotADirectoryError):
@@ -41,7 +41,7 @@ class ScanMediaTests(unittest.TestCase):
 
     def test_iterator_reports_progress_and_yields_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory)
+            root = Path(temporary_directory).resolve()
             media_path = root / "CONTENTS" / "CLIP" / "clip.mxf"
             media_path.parent.mkdir(parents=True)
             media_path.write_bytes(b"media")
@@ -62,7 +62,7 @@ class ScanMediaTests(unittest.TestCase):
 
     def test_p2_xml_metadata_links_video_and_audio_essences(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory)
+            root = Path(temporary_directory).resolve()
             contents = root / "CONTENTS"
             clip_id = "A001AA"
             clip_xml = contents / "CLIP" / f"{clip_id}.XML"
@@ -118,7 +118,7 @@ class ScanMediaTests(unittest.TestCase):
 
     def test_clip_assembly_includes_unmatched_video_but_not_audio_only_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory)
+            root = Path(temporary_directory).resolve()
             video_path = root / "orphan.mov"
             audio_path = root / "orphan.wav"
             video_path.write_bytes(b"video")
@@ -136,7 +136,7 @@ class ScanMediaTests(unittest.TestCase):
 
     def test_p2_xml_with_missing_essences_does_not_invent_matches(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory)
+            root = Path(temporary_directory).resolve()
             clip_xml = root / "CONTENTS" / "CLIP" / "B001AA.XML"
             clip_xml.parent.mkdir(parents=True)
             clip_xml.write_text(
@@ -156,7 +156,7 @@ class ScanMediaTests(unittest.TestCase):
 
     def test_p2_xml_dtd_is_rejected_with_a_visible_warning(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory)
+            root = Path(temporary_directory).resolve()
             clip_xml = root / "CONTENTS" / "CLIP" / "C001AA.XML"
             clip_xml.parent.mkdir(parents=True)
             clip_xml.write_text(

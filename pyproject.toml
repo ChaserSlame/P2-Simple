@@ -13,6 +13,11 @@ dependencies = [
     "pyqtdarktheme==0.1.7",
 ]
 
+[project.optional-dependencies]
+windows-build = [
+    "pyinstaller>=6.11,<7",
+]
+
 [project.scripts]
 p2viewerplus = "p2viewer.app:main"
 

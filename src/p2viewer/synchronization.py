@@ -13,6 +13,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Callable
 
+from p2viewer.media_tools import resolve_media_tool
 from p2viewer.p2_metadata import P2ClipMetadata
 
 
@@ -133,8 +134,12 @@ def _wrapped_delta(value: Fraction, reference: Fraction) -> Fraction:
 
 
 def _probe(path: Path, executable: str) -> dict[str, object]:
+    try:
+        resolved_executable = resolve_media_tool(executable)
+    except FileNotFoundError as error:
+        raise MediaProbeError(str(error)) from error
     command = [
-        executable,
+        resolved_executable,
         "-v",
         "error",
         "-show_entries",
@@ -164,7 +169,10 @@ def _probe(path: Path, executable: str) -> dict[str, object]:
             time.perf_counter() - probe_started,
         )
     except FileNotFoundError as error:
-        raise MediaProbeError(f"No se encontró {executable} en PATH.") from error
+        raise MediaProbeError(
+            str(error)
+            or f"No se encontró {Path(executable).name} en el paquete o PATH."
+        ) from error
     except subprocess.TimeoutExpired as error:
         raise MediaProbeError(f"ffprobe excedió el tiempo al leer {path.name}.") from error
     except subprocess.CalledProcessError as error:
@@ -468,7 +476,14 @@ def build_synced_mxf(
     temporary_path = output_directory / (
         f".{output_path.stem}.{uuid.uuid4().hex}.building.mxf"
     )
-    command = [ffmpeg, "-nostdin", "-hide_banner", "-n", "-loglevel", "error"]
+    command = [
+        resolve_media_tool(ffmpeg),
+        "-nostdin",
+        "-hide_banner",
+        "-n",
+        "-loglevel",
+        "error",
+    ]
     if video_input_offset:
         command.extend(("-itsoffset", _offset_argument(video_input_offset)))
     command.extend(("-i", str(clip.video_file)))

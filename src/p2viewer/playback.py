@@ -6,6 +6,7 @@ import threading
 import time
 from pathlib import Path
 
+from p2viewer.media_tools import resolve_media_tool
 from p2viewer.synchronization import AudioSync
 
 
@@ -287,7 +288,7 @@ def _run_ffmpeg(
 ) -> None:
     try:
         with subprocess.Popen(
-            command,
+            [resolve_media_tool(command[0]), *command[1:]],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
@@ -322,7 +323,7 @@ def _run_ffmpeg(
     except (PreviewRenderCancelled, PreviewRenderError):
         raise
     except FileNotFoundError as error:
-        raise PreviewRenderError("No se encontró ffmpeg en PATH.") from error
+        raise PreviewRenderError(str(error) or "No se encontró ffmpeg en PATH.") from error
     except OSError as error:
         raise PreviewRenderError(f"No se pudo ejecutar ffmpeg: {error}") from error
 

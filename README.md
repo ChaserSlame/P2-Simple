@@ -6,7 +6,27 @@ and browsing supported media files.
 
 ## Installation
 
-### Dependencies
+### Windows portable package
+
+The recommended Windows install does not require Python or a separate FFmpeg
+installation:
+
+1. Download `P2ViewerPlus-windows-x64.zip` from the
+   [GitHub Releases](https://github.com/ChaserSlame/P2-Simple/releases) page.
+2. Extract the entire ZIP to a folder.
+3. Run `P2ViewerPlus.exe`.
+
+The package includes FFmpeg and ffprobe. Keep the extracted folder together;
+do not move the executable out of it. It is a 64-bit package supported on
+Windows 10 version 22H2 or newer. Windows may display a SmartScreen prompt
+because the executable is not code-signed. The included third-party notices
+and license texts are in the package folder.
+
+Each versioned Git tag (`v*`) builds and publishes a ZIP release automatically.
+The workflow can also be run manually from the GitHub Actions tab to produce a
+temporary downloadable artifact.
+
+### Dependencies for running from source
 
 - Python 3.10 or newer.
 - FFmpeg, with both `ffmpeg` and `ffprobe` available on `PATH`. These tools
@@ -14,7 +34,7 @@ and browsing supported media files.
 - PySide6 6.8 or newer and PyQtDarkTheme 0.1.7. They are installed
   automatically with the project below.
 
-Check that Python and FFmpeg are available before installing:
+Check that Python and FFmpeg are available before installing from source:
 
 ```text
 python --version
@@ -23,6 +43,8 @@ ffprobe -version
 ```
 
 ### Windows
+
+For the portable build, follow the instructions above. To run from source:
 
 Install Python 3.10 or newer from [python.org](https://www.python.org/downloads/windows/)
 and enable the option to add Python to `PATH`. Install FFmpeg and make sure its

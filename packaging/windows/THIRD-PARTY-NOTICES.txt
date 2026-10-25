@@ -1,0 +1,29 @@
+P2ViewerPlus Windows portable package: third-party notices
+
+FFmpeg 9.0
+This package includes the win64 LGPL static build of ffmpeg.exe and ffprobe.exe
+from BtbN/FFmpeg-Builds. The LGPL variant excludes libraries that require GPL
+or nonfree licensing. FFmpeg is licensed under the GNU LGPL version 2.1 or
+later; see COPYING.LGPLv2.1.txt in this package.
+
+FFmpeg source release:
+https://ffmpeg.org/releases/ffmpeg-9.0.tar.xz
+Build project and build configuration:
+https://github.com/BtbN/FFmpeg-Builds
+
+Qt and PySide6
+This package contains Qt and PySide6 components. Qt and PySide6 are available
+under LGPLv3, GPLv3, or commercial terms, depending on the component. The
+LGPLv3 license text is included as COPYING.LGPLv3.txt. Qt's current open-source
+license obligations and source-code information:
+https://www.qt.io/licensing/open-source-lgpl-obligations
+https://doc.qt.io/qtforpython-6/licenses.html
+
+PyInstaller
+The package includes the PyInstaller bootloader, licensed under GPLv2 or later
+with the PyInstaller bootloader exception:
+https://github.com/pyinstaller/pyinstaller/blob/develop/COPYING.txt
+
+PyQtDarkTheme
+PyQtDarkTheme 0.1.7 is licensed under the MIT License:
+https://github.com/5yutan5/PyQtDarkTheme

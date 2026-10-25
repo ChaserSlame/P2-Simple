@@ -98,21 +98,37 @@ Invoke-WebRequest `
     -Uri "https://www.gnu.org/licenses/lgpl-3.0.txt" `
     -OutFile (Join-Path $bundleDirectory "COPYING.LGPLv3.txt")
 
-$ffmpegBuildInfo = (& (Join-Path $bundledTools "ffmpeg.exe") -version 2>&1 |
-    Out-String)
-if ($LASTEXITCODE -ne 0 -or $ffmpegBuildInfo -notmatch "LGPL version") {
+$ffmpegExecutable = Join-Path $bundledTools "ffmpeg.exe"
+$ffprobeExecutable = Join-Path $bundledTools "ffprobe.exe"
+$ffmpegVersion = (& $ffmpegExecutable -version 2>&1 | Out-String)
+$ffmpegVersionExitCode = $LASTEXITCODE
+$ffmpegLicense = (& $ffmpegExecutable -L 2>&1 | Out-String)
+$ffmpegLicenseExitCode = $LASTEXITCODE
+if (
+    $ffmpegVersionExitCode -ne 0 -or
+    $ffmpegLicenseExitCode -ne 0 -or
+    $ffmpegLicense -notmatch "LGPL version"
+) {
     throw "ffmpeg.exe no se ejecutó o no reporta una licencia LGPL."
 }
-$ffprobeBuildInfo = (& (Join-Path $bundledTools "ffprobe.exe") -version 2>&1 |
-    Out-String)
-if ($LASTEXITCODE -ne 0 -or $ffprobeBuildInfo -notmatch "LGPL version") {
+$ffprobeVersion = (& $ffprobeExecutable -version 2>&1 | Out-String)
+$ffprobeVersionExitCode = $LASTEXITCODE
+$ffprobeLicense = (& $ffprobeExecutable -L 2>&1 | Out-String)
+$ffprobeLicenseExitCode = $LASTEXITCODE
+if (
+    $ffprobeVersionExitCode -ne 0 -or
+    $ffprobeLicenseExitCode -ne 0 -or
+    $ffprobeLicense -notmatch "LGPL version"
+) {
     throw "ffprobe.exe no se ejecutó o no reporta una licencia LGPL."
 }
 @(
     "ffmpeg.exe:"
-    $ffmpegBuildInfo
+    $ffmpegVersion
+    $ffmpegLicense
     "ffprobe.exe:"
-    $ffprobeBuildInfo
+    $ffprobeVersion
+    $ffprobeLicense
 ) | Set-Content -Path (Join-Path $bundleDirectory "FFMPEG-BUILD.txt")
 
 $portableZip = Join-Path $repoRoot "dist\P2ViewerPlus-windows-x64.zip"
